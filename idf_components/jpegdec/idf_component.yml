@@ -1,0 +1,21 @@
+name: jpegdec
+version: "1.8.3"
+description: "bitbank2 JPEGDEC with ESP32-S3 SIMD"
+targets:
+  - esp32
+  - esp32s2
+  - esp32s3
+  - esp32p4
+dependencies:
+  espressif/esp-dsp: "^1.7.0"
+files:
+  include:
+    - CMakeLists.txt
+    - JPEGDEC.cpp
+    - jpeg.inl
+    - s3_simd_420.S
+    - s3_simd_444.S
+    - s3_simd_dequant.S
+    - include/**
+    - LICENSE
+    - README.md
