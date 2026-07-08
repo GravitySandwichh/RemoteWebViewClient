@@ -4,6 +4,10 @@ namespace esphome {
 namespace remote_webview {
 namespace cfg {
 
+// Bump with every release so `dump_config` output and idf_component.yml agree
+// on what's actually flashed.
+inline constexpr const char *component_version = "1.3.0";
+
 // Decode task needs headroom for JPEGDEC + draw_pixels_at at high frame rates
 inline constexpr int decode_task_stack = 48 * 1024;
 // WS task stack bumped for stability under high throughput

@@ -61,13 +61,18 @@ class RemoteWebView : public Component {
   float get_setup_priority() const override { return setup_priority::LATE; }
 
  private:
+  // Reassembly buffers are handed off between the WS event handler (producer)
+  // and the decode task (consumer) by slot index into a fixed pool, not by
+  // malloc/free per message. At up to ~60 messages/sec, per-message
+  // heap_caps_malloc/free churned internal/PSRAM heap constantly and risked
+  // fragmenting it over long uptimes; a pool sized to the queue depth removes
+  // allocator calls from the hot path entirely.
   struct WsMsg {
-    uint8_t *buf{nullptr};
-    size_t   len{0};
-    void    *client{nullptr}; // opaque esp_websocket_client_handle_t
+    int    slot{-1};
+    size_t len{0};
   };
   struct WsReasm {
-    uint8_t *buf{nullptr};
+    int slot{-1};
     size_t total{0}, filled{0};
   };
 
@@ -119,7 +124,11 @@ class RemoteWebView : public Component {
   uint32_t frame_stats_count_{0};
   size_t   frame_stats_bytes_{0};
 
-  QueueHandle_t     q_decode_{nullptr};
+  static constexpr int kReasmPoolSize = cfg::decode_queue_depth;
+  uint8_t      *reasm_pool_[kReasmPoolSize]{};
+  size_t        reasm_pool_cap_{0};
+  QueueHandle_t q_free_{nullptr};    // free slot indices, ready to be filled
+  QueueHandle_t q_decode_{nullptr};  // filled slots, ready to decode
   SemaphoreHandle_t ws_send_mtx_{nullptr};
   TaskHandle_t      t_ws_{nullptr};
   TaskHandle_t      t_decode_{nullptr};
@@ -140,9 +149,9 @@ class RemoteWebView : public Component {
   static void decode_task_tramp_(void *arg);
 
   static void ws_event_handler_(void *handler_arg, esp_event_base_t base, int32_t event_id, void *event_data);
-  static void reasm_reset_(WsReasm &r);
+  static void reasm_release_(RemoteWebView *self, WsReasm &r);
 
-  void process_packet_(void *client, const uint8_t *data, size_t len);
+  void process_packet_(const uint8_t *data, size_t len);
   void process_frame_packet_(const uint8_t *data, size_t len);
   void process_frame_stats_packet_(const uint8_t *data, size_t len);
   bool decode_jpeg_tile_to_lcd_(int16_t dst_x, int16_t dst_y, const uint8_t *data, size_t len);

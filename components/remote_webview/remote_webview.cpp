@@ -80,9 +80,24 @@ void RemoteWebView::setup() {
   display_width_ = display_->get_width();
   display_height_ = display_->get_height();
 
+  // Fixed pool of reassembly buffers, sized to the decode queue depth, so the
+  // WS event handler and decode task never call malloc/free on the hot path
+  // (see WsMsg/WsReasm comment in the header for why).
+  reasm_pool_cap_ = (size_t)((max_bytes_per_msg_ > 0) ? max_bytes_per_msg_ : cfg::ws_max_message_bytes);
+  q_free_ = xQueueCreate(kReasmPoolSize, sizeof(int));
   q_decode_ = xQueueCreate(cfg::decode_queue_depth, sizeof(WsMsg));
   ws_send_mtx_ = xSemaphoreCreateMutex();
   state_mtx_ = xSemaphoreCreateMutex();
+
+  for (int i = 0; i < kReasmPoolSize; i++) {
+    reasm_pool_[i] = (uint8_t *)heap_caps_malloc(reasm_pool_cap_, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!reasm_pool_[i]) reasm_pool_[i] = (uint8_t *)heap_caps_malloc(reasm_pool_cap_, MALLOC_CAP_8BIT);
+    if (!reasm_pool_[i]) {
+      ESP_LOGE(TAG, "Failed to allocate reassembly buffer %d/%d (%u bytes)", i + 1, kReasmPoolSize, (unsigned)reasm_pool_cap_);
+      continue;
+    }
+    xQueueSend(q_free_, &i, 0);
+  }
 
   start_decode_task_();
   start_ws_task_();
@@ -153,6 +168,7 @@ void RemoteWebView::loop() {
 
 void RemoteWebView::dump_config() {
   ESP_LOGCONFIG(TAG, "remote_webview:");
+  ESP_LOGCONFIG(TAG, "  version: %s", cfg::component_version);
 
   const std::string id = device_id_.empty() ? resolve_device_id_() : device_id_;
   ESP_LOGCONFIG(TAG, "  id: %s", id.c_str());
@@ -263,9 +279,12 @@ void RemoteWebView::ws_task_tramp_(void *arg) {
   }
 }
 
-void RemoteWebView::reasm_reset_(WsReasm &r) {
-  if (r.buf) free(r.buf);
-  r.buf = nullptr; r.total = 0; r.filled = 0;
+void RemoteWebView::reasm_release_(RemoteWebView *self, WsReasm &r) {
+  if (r.slot >= 0 && self && self->q_free_) {
+    int slot = r.slot;
+    xQueueSend(self->q_free_, &slot, 0);
+  }
+  r.slot = -1; r.total = 0; r.filled = 0;
 }
 
 void RemoteWebView::ws_event_handler_(void *handler_arg, esp_event_base_t, int32_t event_id, void *event_data) {
@@ -286,8 +305,8 @@ void RemoteWebView::ws_event_handler_(void *handler_arg, esp_event_base_t, int32
     case WEBSOCKET_EVENT_DISCONNECTED:
       if (self_) self_->ws_client_ = nullptr;
       ESP_LOGI(TAG, "[ws] disconnected");
-      if (self_) self_->last_keepalive_us_ = 0; 
-      reasm_reset_(*r);
+      if (self_) self_->last_keepalive_us_ = 0;
+      reasm_release_(self_, *r);
       websocket_force_reconnect(e->client);
       break;
 
@@ -295,8 +314,8 @@ void RemoteWebView::ws_event_handler_(void *handler_arg, esp_event_base_t, int32
     case WEBSOCKET_EVENT_CLOSED:
       if (self_) self_->ws_client_ = nullptr;
       ESP_LOGI(TAG, "[ws] closed");
-      if (self_) self_->last_keepalive_us_ = 0; 
-      reasm_reset_(*r);
+      if (self_) self_->last_keepalive_us_ = 0;
+      reasm_release_(self_, *r);
       websocket_force_reconnect(e->client);
       break;
 #endif
@@ -310,37 +329,38 @@ void RemoteWebView::ws_event_handler_(void *handler_arg, esp_event_base_t, int32
       if (!is_bin) break;
 
       if (e->payload_offset == 0) {
-        reasm_reset_(*r);
-        const size_t max_allowed = (self_ && self_->max_bytes_per_msg_ > 0) 
-                                   ? (size_t)self_->max_bytes_per_msg_ 
-                                   : cfg::ws_max_message_bytes;
+        reasm_release_(self_, *r);
+        const size_t max_allowed = self_->reasm_pool_cap_;
         if ((size_t)e->payload_len > max_allowed) {
           ESP_LOGE(TAG, "WS message too large: %u > %u", (unsigned)e->payload_len, (unsigned)max_allowed);
           break;
         }
+        int slot;
+        if (!self_->q_free_ || xQueueReceive(self_->q_free_, &slot, 0) != pdTRUE) {
+          ESP_LOGW(TAG, "reassembly pool exhausted, dropping message");
+          break;
+        }
+        r->slot  = slot;
         r->total = (size_t)e->payload_len;
-        r->buf   = (uint8_t *)heap_caps_malloc(r->total, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-        if (!r->buf) r->buf = (uint8_t *)heap_caps_malloc(r->total, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-        if (!r->buf) { ESP_LOGE(TAG, "malloc %u failed", (unsigned)r->total); r->total = 0; break; }
       }
-      if (!r->buf || r->total == 0) break;
+      if (r->slot < 0 || r->total == 0) break;
 
       if ((size_t)e->payload_offset + frag_len > r->total) {
         ESP_LOGE(TAG, "bad fragment bounds");
-        reasm_reset_(*r);
+        reasm_release_(self_, *r);
         break;
       }
-      memcpy(r->buf + e->payload_offset, frag, frag_len);
+      memcpy(self_->reasm_pool_[r->slot] + e->payload_offset, frag, frag_len);
       size_t new_filled = (size_t)e->payload_offset + frag_len;
       if (new_filled > r->filled) r->filled = new_filled;
 
       if (r->filled == r->total) {
         WsMsg m;
-        m.buf = r->buf; m.len = r->total; m.client = e->client;
-        r->buf = nullptr; r->total = 0; r->filled = 0;
+        m.slot = r->slot; m.len = r->total;
+        r->slot = -1; r->total = 0; r->filled = 0;
         if (!self_->q_decode_ || xQueueSend(self_->q_decode_, &m, 0) != pdTRUE) {
           ESP_LOGW(TAG, "decode queue full, dropping packet");
-          free(m.buf);
+          xQueueSend(self_->q_free_, &m.slot, 0);
         }
       }
       break;
@@ -366,13 +386,13 @@ void RemoteWebView::decode_task_tramp_(void *arg) {
   WsMsg m;
   for (;;) {
     if (xQueueReceive(self->q_decode_, &m, portMAX_DELAY) == pdTRUE) {
-      self->process_packet_(m.client, m.buf, m.len);
-      free(m.buf);
+      self->process_packet_(self->reasm_pool_[m.slot], m.len);
+      xQueueSend(self->q_free_, &m.slot, portMAX_DELAY);
     }
   }
 }
 
-void RemoteWebView::process_packet_(void * /*client*/, const uint8_t *data, size_t len) {
+void RemoteWebView::process_packet_(const uint8_t *data, size_t len) {
   if (!data || len == 0) return;
 
   const proto::MsgType type = (proto::MsgType)data[0];
@@ -412,7 +432,11 @@ void RemoteWebView::process_frame_packet_(const uint8_t *data, size_t len)
   for (uint16_t i = 0; i < fi.tile_count; i++) {
     proto::TileHeader th{};
     if (!proto::parse_tile_header(data, len, th, off)) return;
-    if (off + th.dlen > len) return;
+    // th.dlen is attacker/corruption-controlled (uint32_t from the wire); computing
+    // off + th.dlen can wrap around size_t and pass an overflowed check, letting a
+    // decode call read far past the end of `data`. Compare the other way instead,
+    // which parse_tile_header already guarantees can't underflow (off <= len).
+    if (th.dlen > len - off) return;
 
     if (th.w == 0 || th.h == 0 || th.w > display_width_ || th.h > display_height_) {
       off += th.dlen;
