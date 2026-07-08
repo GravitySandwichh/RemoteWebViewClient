@@ -48,6 +48,7 @@ class RemoteWebView : public Component {
   void set_max_bytes_per_msg(int v) { max_bytes_per_msg_ = v; }
   void set_big_endian(bool v) { rgb565_big_endian_ = v; }
   void set_rotation(int v) { rotation_ = v; }
+  void set_dual_core_decode(bool v) { dual_core_decode_ = v; }
   void disable_touch(bool disable);
   bool open_url(const std::string &s);
   std::string get_current_url() const;
@@ -104,6 +105,7 @@ class RemoteWebView : public Component {
   bool rgb565_big_endian_{true};
   int rotation_{0};
   bool touch_disabled_{false};
+  bool dual_core_decode_{true};
 
 #if REMOTE_WEBVIEW_HW_JPEG
   jpeg_decoder_handle_t hw_dec_{nullptr};
@@ -131,7 +133,39 @@ class RemoteWebView : public Component {
   QueueHandle_t q_decode_{nullptr};  // filled slots, ready to decode
   SemaphoreHandle_t ws_send_mtx_{nullptr};
   TaskHandle_t      t_ws_{nullptr};
-  TaskHandle_t      t_decode_{nullptr};
+
+  // Dual-core decode. Both workers block on the same q_decode_ (natural work
+  // stealing); each owns a private JPEGDEC instance. Worker 0 is pinned to
+  // core 1 (as the single decode task always was); worker 1 to core 0, below
+  // the WS client task's priority so it only consumes cycles the network
+  // stack doesn't need. Pinning also makes concurrent SIMD safe: the S3's
+  // PIE vector registers are per-core and not saved on context switch, so
+  // exactly one SIMD-using task per core is a hard requirement.
+  struct DecodeWorker {
+    RemoteWebView *rwv{nullptr};
+    JPEGDEC       *jd{nullptr};
+    int            index{0};
+  };
+  static constexpr int kMaxDecodeWorkers = 2;
+  DecodeWorker  workers_[kMaxDecodeWorkers]{};
+  TaskHandle_t  t_decode_[kMaxDecodeWorkers]{};
+  int           decode_workers_{1};
+
+  // Serializes display_->draw_pixels_at between workers: esp_lcd's cache
+  // writeback path is not documented safe for concurrent cross-core calls,
+  // and PSRAM framebuffer writes contend on one bus anyway — parallel decode
+  // is where the win is, parallel draw would buy nothing.
+  SemaphoreHandle_t draw_mtx_{nullptr};
+  // Guards the per-frame/stat counters below against concurrent workers.
+  SemaphoreHandle_t stats_mtx_{nullptr};
+  // Frame barrier: tiles of one frame may decode in parallel, but a worker
+  // holding a message of a NEWER frame waits until the older frame's
+  // in-flight decodes drain. The decode queue is FIFO, so waiting on
+  // inflight==0 is sufficient — without this, frame N+1 could draw before a
+  // late tile of frame N and be overwritten by stale pixels. frame_id_ (the
+  // stats "current frame", guarded by stats_mtx_) doubles as the barrier's
+  // frame identity.
+  int barrier_inflight_{0};
 
   esp_websocket_client_handle_t ws_client_{nullptr};
 
@@ -144,26 +178,24 @@ class RemoteWebView : public Component {
   text_sensor::TextSensor *url_sensor_{nullptr};
 
   void start_ws_task_();
-  void start_decode_task_();
+  void start_decode_tasks_();
   static void ws_task_tramp_(void *arg);
   static void decode_task_tramp_(void *arg);
 
   static void ws_event_handler_(void *handler_arg, esp_event_base_t base, int32_t event_id, void *event_data);
   static void reasm_release_(RemoteWebView *self, WsReasm &r);
 
-  void process_packet_(const uint8_t *data, size_t len);
-  void process_frame_packet_(const uint8_t *data, size_t len);
+  void process_packet_(JPEGDEC *jd, const uint8_t *data, size_t len);
+  void process_frame_packet_(JPEGDEC *jd, const uint8_t *data, size_t len);
   void process_frame_stats_packet_(const uint8_t *data, size_t len);
-  bool decode_jpeg_tile_to_lcd_(int16_t dst_x, int16_t dst_y, const uint8_t *data, size_t len);
-  bool decode_jpeg_tile_software_(int16_t dst_x, int16_t dst_y, const uint8_t *data, size_t len);
+  bool frame_barrier_enter_(uint32_t frame_id, size_t msg_len, uint16_t tile_count);
+  void frame_barrier_exit_();
+  bool decode_jpeg_tile_to_lcd_(JPEGDEC *jd, int16_t dst_x, int16_t dst_y, const uint8_t *data, size_t len);
+  bool decode_jpeg_tile_software_(JPEGDEC *jd, int16_t dst_x, int16_t dst_y, const uint8_t *data, size_t len);
+  JPEGDEC *alloc_jpegdec_();
 
   static int jpeg_draw_cb_s_(JPEGDRAW *p);
   int jpeg_draw_cb_(JPEGDRAW *p);
-  // Heap-allocated (pinned to internal SRAM in setup()) rather than a by-value
-  // member: JPEGDEC carries ~30-40 KB of hot decode buffers, and as a member it
-  // pushed this whole object past ESP-IDF's "always internal" malloc threshold,
-  // landing the decoder's working set in slow, contended PSRAM.
-  JPEGDEC *jd_{nullptr};
 
   bool ws_send_touch_event_(proto::TouchType type, int x, int y, uint8_t pid);
   bool ws_send_keepalive_();

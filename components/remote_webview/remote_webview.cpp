@@ -102,23 +102,35 @@ void RemoteWebView::setup() {
     xQueueSend(q_free_, &i, 0);
   }
 
-  // Pin the JPEG decoder's working state to internal SRAM. The self-test
-  // measured full-frame decode at ~53 ms with this state in PSRAM (where the
-  // panel's refresh DMA is also constantly reading); the decoder touches these
-  // buffers for every 8x8 block, so keeping them on-chip removes a large PSRAM
-  // round trip from the innermost decode loop. Falls back to the default heap
-  // if internal memory is tight — same behavior as before, just not faster.
-  jd_ = (JPEGDEC *) heap_caps_malloc(sizeof(JPEGDEC), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-  if (!jd_) jd_ = (JPEGDEC *) heap_caps_malloc(sizeof(JPEGDEC), MALLOC_CAP_8BIT);
-  if (jd_) {
-    new (jd_) JPEGDEC();  // value-init zeroes the decoder state
-    ESP_LOGI(TAG, "JPEGDEC state (%u bytes) in %s RAM", (unsigned) sizeof(JPEGDEC),
-             esp_ptr_internal(jd_) ? "internal" : "PSRAM");
-  } else {
-    ESP_LOGE(TAG, "Failed to allocate JPEGDEC state (%u bytes)", (unsigned) sizeof(JPEGDEC));
-  }
+  draw_mtx_ = xSemaphoreCreateMutex();
+  stats_mtx_ = xSemaphoreCreateMutex();
 
-  start_decode_task_();
+  // Decide the worker count with staged fallbacks: dual-core can be disabled
+  // from YAML, is never used with the P4 hardware decoder (hw_dec_ and its
+  // buffers are shared, not thread-safe), and degrades back to one worker if
+  // the second decoder's memory or task can't be allocated.
+#if REMOTE_WEBVIEW_HW_JPEG
+  int want_workers = 1;
+#else
+  int want_workers = dual_core_decode_ ? kMaxDecodeWorkers : 1;
+#endif
+
+  for (int w = 0; w < want_workers; w++) {
+    JPEGDEC *jd = alloc_jpegdec_();
+    if (!jd) {
+      if (w == 0) {
+        ESP_LOGE(TAG, "Failed to allocate JPEGDEC state (%u bytes)", (unsigned) sizeof(JPEGDEC));
+      } else {
+        ESP_LOGW(TAG, "No memory for decoder %d, staying single-core", w);
+      }
+      want_workers = w;
+      break;
+    }
+    workers_[w] = DecodeWorker{this, jd, w};
+  }
+  decode_workers_ = want_workers;
+
+  start_decode_tasks_();
   start_ws_task_();
 
   if (touch_) {
@@ -188,6 +200,7 @@ void RemoteWebView::loop() {
 void RemoteWebView::dump_config() {
   ESP_LOGCONFIG(TAG, "remote_webview:");
   ESP_LOGCONFIG(TAG, "  version: %s", cfg::component_version);
+  ESP_LOGCONFIG(TAG, "  decode workers: %d", decode_workers_);
 
   const std::string id = device_id_.empty() ? resolve_device_id_() : device_id_;
   ESP_LOGCONFIG(TAG, "  id: %s", id.c_str());
@@ -396,22 +409,48 @@ void RemoteWebView::ws_event_handler_(void *handler_arg, esp_event_base_t, int32
   }
 }
 
-void RemoteWebView::start_decode_task_() {
-  xTaskCreatePinnedToCore(&RemoteWebView::decode_task_tramp_, "rwv_decode", cfg::decode_task_stack, this, 6, &t_decode_, 1);
+JPEGDEC *RemoteWebView::alloc_jpegdec_() {
+  // Internal SRAM first: the decoder touches its ~25-40 KB working set for
+  // every 8x8 block, and as a plain member it would land in PSRAM (the
+  // component object exceeds ESP-IDF's "always internal" malloc threshold).
+  auto *jd = (JPEGDEC *) heap_caps_malloc(sizeof(JPEGDEC), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+  if (!jd) jd = (JPEGDEC *) heap_caps_malloc(sizeof(JPEGDEC), MALLOC_CAP_8BIT);
+  if (!jd) return nullptr;
+  new (jd) JPEGDEC();  // value-init zeroes the decoder state
+  ESP_LOGI(TAG, "JPEGDEC state (%u bytes) in %s RAM", (unsigned) sizeof(JPEGDEC),
+           esp_ptr_internal(jd) ? "internal" : "PSRAM");
+  return jd;
+}
+
+void RemoteWebView::start_decode_tasks_() {
+  for (int w = 0; w < decode_workers_; w++) {
+    const int core = (w == 0) ? 1 : 0;
+    const int prio = (w == 0) ? cfg::decode_task_prio_core1 : cfg::decode_task_prio_core0;
+    const char *name = (w == 0) ? "rwv_dec0" : "rwv_dec1";
+    if (xTaskCreatePinnedToCore(&RemoteWebView::decode_task_tramp_, name, cfg::decode_task_stack,
+                                &workers_[w], prio, &t_decode_[w], core) != pdPASS) {
+      ESP_LOGW(TAG, "Failed to start decode worker %d%s", w,
+               (w > 0) ? ", staying single-core" : "");
+      decode_workers_ = w;
+      break;
+    }
+  }
+  ESP_LOGI(TAG, "decode workers: %d", decode_workers_);
 }
 
 void RemoteWebView::decode_task_tramp_(void *arg) {
-  auto *self = reinterpret_cast<RemoteWebView*>(arg);
+  auto *ctx = reinterpret_cast<DecodeWorker*>(arg);
+  auto *self = ctx->rwv;
   WsMsg m;
   uint32_t streak = 0;
   for (;;) {
     if (xQueueReceive(self->q_decode_, &m, portMAX_DELAY) != pdTRUE) continue;
-    self->process_packet_(self->reasm_pool_[m.slot], m.len);
+    self->process_packet_(ctx->jd, self->reasm_pool_[m.slot], m.len);
     xQueueSend(self->q_free_, &m.slot, portMAX_DELAY);
 
     // Watchdog protection: during sustained animation the queue can stay
-    // non-empty indefinitely, so this task (priority 6) would never block and
-    // the idle task — which the ESP-IDF Task Watchdog (5s) monitors — starves,
+    // non-empty indefinitely, so this task would never block and the idle
+    // task — which the ESP-IDF Task Watchdog (5s) monitors — starves,
     // panicking the device. But an unconditional vTaskDelay(1) per message
     // costs up to a full tick each, which is real money for 1-2 ms partial
     // tiles at 30fps. So: when the queue drains, the blocking receive above
@@ -427,13 +466,13 @@ void RemoteWebView::decode_task_tramp_(void *arg) {
   }
 }
 
-void RemoteWebView::process_packet_(const uint8_t *data, size_t len) {
+void RemoteWebView::process_packet_(JPEGDEC *jd, const uint8_t *data, size_t len) {
   if (!data || len == 0) return;
 
   const proto::MsgType type = (proto::MsgType)data[0];
   switch (type) {
     case proto::MsgType::Frame:
-      process_frame_packet_(data, len);
+      process_frame_packet_(jd, data, len);
       break;
     case proto::MsgType::FrameStats:
       process_frame_stats_packet_(data, len);
@@ -447,7 +486,55 @@ void RemoteWebView::process_packet_(const uint8_t *data, size_t len) {
   }
 }
 
-void RemoteWebView::process_frame_packet_(const uint8_t *data, size_t len)
+// Admit this message into the current frame, or — if it belongs to a newer
+// frame — wait until every in-flight decode of the previous frame finishes.
+// The decode queue is FIFO, so a worker holding frame N+1 implies all frame-N
+// messages were already dequeued; draining inflight is therefore a complete
+// ordering guarantee. Also owns the per-frame stats reset/accumulation that
+// used to live unguarded in process_frame_packet_.
+//
+// Returns false when the message is for a frame OLDER than one that already
+// started (serial-number comparison). That happens only in a narrow race: a
+// worker dequeues frame N+1, gets preempted before reaching this barrier, and
+// the other worker meanwhile dequeues N+2 and advances past it. Drawing the
+// stale N+1 tiles would overwrite newer pixels; dropping them merely leaves
+// that region one frame behind until the next update or drift sweep.
+bool RemoteWebView::frame_barrier_enter_(uint32_t frame_id, size_t msg_len, uint16_t tile_count) {
+  for (;;) {
+    xSemaphoreTake(stats_mtx_, portMAX_DELAY);
+    if (frame_id == frame_id_) {
+      frame_bytes_ += msg_len;
+      frame_tiles_ += tile_count;
+      barrier_inflight_++;
+      xSemaphoreGive(stats_mtx_);
+      return true;
+    }
+    if (barrier_inflight_ == 0) {
+      if (frame_id_ != 0xffffffffu && (int32_t)(frame_id - frame_id_) < 0) {
+        xSemaphoreGive(stats_mtx_);
+        ESP_LOGW(TAG, "dropping stale frame %lu (current %lu)", (unsigned long)frame_id, (unsigned long)frame_id_);
+        return false;
+      }
+      frame_id_ = frame_id;
+      frame_tiles_ = tile_count;
+      frame_bytes_ = msg_len;
+      frame_start_us_ = esp_timer_get_time();
+      barrier_inflight_++;
+      xSemaphoreGive(stats_mtx_);
+      return true;
+    }
+    xSemaphoreGive(stats_mtx_);
+    vTaskDelay(1);  // previous frame still decoding on the other worker
+  }
+}
+
+void RemoteWebView::frame_barrier_exit_() {
+  xSemaphoreTake(stats_mtx_, portMAX_DELAY);
+  barrier_inflight_--;
+  xSemaphoreGive(stats_mtx_);
+}
+
+void RemoteWebView::process_frame_packet_(JPEGDEC *jd, const uint8_t *data, size_t len)
 {
   if (!data || len < sizeof(proto::FrameHeader)) return;
 
@@ -455,23 +542,17 @@ void RemoteWebView::process_frame_packet_(const uint8_t *data, size_t len)
   size_t off = 0;
   if (!proto::parse_frame_header(data, len, fi, off)) return;
 
-  if (fi.frame_id != frame_id_) {
-    frame_id_ = fi.frame_id;
-    frame_tiles_= 0;
-    frame_bytes_= 0;
-    frame_start_us_ = esp_timer_get_time();
-  }
-  frame_bytes_ += len;
-  frame_tiles_ += fi.tile_count;
+  if (!frame_barrier_enter_(fi.frame_id, len, fi.tile_count))
+    return;  // stale frame dropped — no inflight slot was taken
 
   for (uint16_t i = 0; i < fi.tile_count; i++) {
     proto::TileHeader th{};
-    if (!proto::parse_tile_header(data, len, th, off)) return;
+    if (!proto::parse_tile_header(data, len, th, off)) break;
     // th.dlen is attacker/corruption-controlled (uint32_t from the wire); computing
     // off + th.dlen can wrap around size_t and pass an overflowed check, letting a
     // decode call read far past the end of `data`. Compare the other way instead,
     // which parse_tile_header already guarantees can't underflow (off <= len).
-    if (th.dlen > len - off) return;
+    if (th.dlen > len - off) break;
 
     if (th.w == 0 || th.h == 0 || th.w > display_width_ || th.h > display_height_) {
       off += th.dlen;
@@ -479,36 +560,48 @@ void RemoteWebView::process_frame_packet_(const uint8_t *data, size_t len)
     }
 
     if (fi.enc == proto::Encoding::JPEG && th.dlen) {
-      decode_jpeg_tile_to_lcd_((int16_t)th.x, (int16_t)th.y, data + off, th.dlen);
+      decode_jpeg_tile_to_lcd_(jd, (int16_t)th.x, (int16_t)th.y, data + off, th.dlen);
     }
-    
+
     off += th.dlen;
   }
 
   if (fi.flags & proto::kFlafLastOfFrame) {
+    // Note: with two workers a sibling message of this frame may still be
+    // decoding when the flagged message finishes, so the recorded time can
+    // read slightly short. It feeds only the debug log, self-test averages,
+    // and the (once-per-second-throttled) on_frame_update trigger — none of
+    // which warrant a completion-tracking mechanism.
+    xSemaphoreTake(stats_mtx_, portMAX_DELAY);
     const uint32_t time_ms = (esp_timer_get_time() - frame_start_us_) / 1000ULL;
     frame_stats_bytes_ += frame_bytes_;
     frame_stats_time_ += time_ms;
     frame_stats_count_++;
     ESP_LOGD(TAG, "frame %lu: tiles %u (%u bytes) - %lu ms", frame_id_, frame_tiles_, frame_bytes_, time_ms);
+    xSemaphoreGive(stats_mtx_);
 
     this->frame_update_pending_.store(true, std::memory_order_release);
   }
+
+  frame_barrier_exit_();
 }
 
 void RemoteWebView::process_frame_stats_packet_(const uint8_t *data, size_t len)
 {
+  xSemaphoreTake(stats_mtx_, portMAX_DELAY);
   uint32_t avg_render_time = 0;
   if (frame_stats_count_ > 0)
     avg_render_time = frame_stats_time_ / frame_stats_count_;
-
-  ESP_LOGD(TAG, "sending frame stats: avg_time=%u ms, bytes=%u", (unsigned)avg_render_time, (unsigned)frame_stats_bytes_);
-  uint8_t pkt[sizeof(proto::FrameStatsPacket)];
-  const size_t n = proto::build_frame_stats_packet(avg_render_time, frame_stats_bytes_, pkt);
+  const size_t stats_bytes = frame_stats_bytes_;
 
   frame_stats_time_ = 0;
   frame_stats_count_ = 0;
   frame_stats_bytes_ = 0;
+  xSemaphoreGive(stats_mtx_);
+
+  ESP_LOGD(TAG, "sending frame stats: avg_time=%u ms, bytes=%u", (unsigned)avg_render_time, (unsigned)stats_bytes);
+  uint8_t pkt[sizeof(proto::FrameStatsPacket)];
+  const size_t n = proto::build_frame_stats_packet(avg_render_time, stats_bytes, pkt);
 
   const TickType_t to = pdMS_TO_TICKS(50);
   if (xSemaphoreTake(ws_send_mtx_, to) != pdTRUE)
@@ -518,14 +611,16 @@ void RemoteWebView::process_frame_stats_packet_(const uint8_t *data, size_t len)
   xSemaphoreGive(ws_send_mtx_);
 }
 
-bool RemoteWebView::decode_jpeg_tile_to_lcd_(int16_t dst_x, int16_t dst_y, const uint8_t *data, size_t len) {
+bool RemoteWebView::decode_jpeg_tile_to_lcd_(JPEGDEC *jd, int16_t dst_x, int16_t dst_y, const uint8_t *data, size_t len) {
   if (!data || !len) return false;
 
 #if REMOTE_WEBVIEW_HW_JPEG
+  // Note: the HW decoder and its buffers are shared, which is why setup()
+  // caps decode_workers_ at 1 when REMOTE_WEBVIEW_HW_JPEG is enabled.
   if (hw_dec_ && hw_decode_input_buf_ && hw_decode_output_buf_) {
     jpeg_decode_picture_info_t hdr{};
     if (jpeg_decoder_get_info(data, (uint32_t)len, &hdr) != ESP_OK || !hdr.width || !hdr.height) {
-      return decode_jpeg_tile_software_(dst_x, dst_y, data, len);
+      return decode_jpeg_tile_software_(jd, dst_x, dst_y, data, len);
     }
 
     const int aligned_w = (hdr.width  + 15) & ~15;
@@ -534,12 +629,12 @@ bool RemoteWebView::decode_jpeg_tile_to_lcd_(int16_t dst_x, int16_t dst_y, const
 
     if (aligned_w != (int)hdr.width) {
       ESP_LOGW(TAG, "jpeg dimensions not aligned: %u x %u", (unsigned)hdr.width, (unsigned)hdr.height);
-      return decode_jpeg_tile_software_(dst_x, dst_y, data, len);
+      return decode_jpeg_tile_software_(jd, dst_x, dst_y, data, len);
     }
-    
+
     if (len > hw_decode_input_size_ || out_sz > hw_decode_output_size_) {
       ESP_LOGW(TAG, "tile too large for HW decoder buffers");
-      return decode_jpeg_tile_software_(dst_x, dst_y, data, len);
+      return decode_jpeg_tile_software_(jd, dst_x, dst_y, data, len);
     }
 
     jpeg_decode_cfg_t jcfg{};
@@ -548,45 +643,47 @@ bool RemoteWebView::decode_jpeg_tile_to_lcd_(int16_t dst_x, int16_t dst_y, const
     jcfg.conv_std      = JPEG_YUV_RGB_CONV_STD_BT709;
 
     memcpy(hw_decode_input_buf_, data, len);
-    
+
     uint32_t written = 0;
-    esp_err_t dr = jpeg_decoder_process(hw_dec_, &jcfg, hw_decode_input_buf_, (uint32_t)len, 
+    esp_err_t dr = jpeg_decoder_process(hw_dec_, &jcfg, hw_decode_input_buf_, (uint32_t)len,
                                         hw_decode_output_buf_, (uint32_t)hw_decode_output_size_, &written);
 
     if (dr != ESP_OK) {
-      return decode_jpeg_tile_software_(dst_x, dst_y, data, len);
+      return decode_jpeg_tile_software_(jd, dst_x, dst_y, data, len);
     }
 
+    xSemaphoreTake(draw_mtx_, portMAX_DELAY);
     display_->draw_pixels_at(dst_x, dst_y, (int)hdr.width, (int)hdr.height, hw_decode_output_buf_,
         esphome::display::COLOR_ORDER_RGB,
         esphome::display::COLOR_BITNESS_565,
         rgb565_big_endian_);
+    xSemaphoreGive(draw_mtx_);
 
     return true;
   }
 #endif  // REMOTE_WEBVIEW_HW_JPEG
 
-  return decode_jpeg_tile_software_(dst_x, dst_y, data, len);
+  return decode_jpeg_tile_software_(jd, dst_x, dst_y, data, len);
 }
 
-bool RemoteWebView::decode_jpeg_tile_software_(int16_t dst_x, int16_t dst_y, const uint8_t *data, size_t len) {
-  if (!jd_) return false;
+bool RemoteWebView::decode_jpeg_tile_software_(JPEGDEC *jd, int16_t dst_x, int16_t dst_y, const uint8_t *data, size_t len) {
+  if (!jd) return false;
 
-  if (!jd_->openRAM((uint8_t*)data, (int)len, &RemoteWebView::jpeg_draw_cb_s_)) {
-    ESP_LOGE(TAG, "openRAM failed (len=%u) err=%d", (unsigned)len, jd_->getLastError());
+  if (!jd->openRAM((uint8_t*)data, (int)len, &RemoteWebView::jpeg_draw_cb_s_)) {
+    ESP_LOGE(TAG, "openRAM failed (len=%u) err=%d", (unsigned)len, jd->getLastError());
     return false;
   }
 
-  jd_->setMaxOutputSize(8 * 2048);
-  jd_->setPixelType(rgb565_big_endian_ ? RGB565_BIG_ENDIAN : RGB565_LITTLE_ENDIAN);
+  jd->setMaxOutputSize(8 * 2048);
+  jd->setPixelType(rgb565_big_endian_ ? RGB565_BIG_ENDIAN : RGB565_LITTLE_ENDIAN);
 
-  const int rc = jd_->decode(dst_x, dst_y, 0);
+  const int rc = jd->decode(dst_x, dst_y, 0);
   if (rc == 0) {
-    ESP_LOGE(TAG, "decode rc=%d err=%d", rc, jd_->getLastError());
-    jd_->close();
+    ESP_LOGE(TAG, "decode rc=%d err=%d", rc, jd->getLastError());
+    jd->close();
     return false;
   }
-  jd_->close();
+  jd->close();
   return true;
 }
 
@@ -594,14 +691,23 @@ int RemoteWebView::jpeg_draw_cb_s_(JPEGDRAW *p) {
   return self_ ? self_->jpeg_draw_cb_(p) : 0;
 }
 
+// Runs inside JPEGDEC's decode loop on whichever worker owns the decode.
+// Reads only immutable-after-setup state (display_, bounds, endianness);
+// the draw itself is serialized across workers via draw_mtx_ because
+// esp_lcd's memcpy+cache-writeback path is not documented safe for
+// concurrent cross-core calls. Serializing draw costs almost nothing:
+// the PSRAM bus is a single shared resource, so parallel draws would
+// contend head-to-head anyway — the parallel win lives in the decode
+// (Huffman + SIMD) that happens between these callbacks.
 int RemoteWebView::jpeg_draw_cb_(JPEGDRAW *p) {
   int32_t x = p->x, y = p->y, w = p->iWidth, h = p->iHeight;
-  
+
   if (x >= display_width_ || y >= display_height_) return 1;
   if (x + w > display_width_) w = display_width_ - x;
   if (y + h > display_height_) h = display_height_ - y;
   if (w <= 0 || h <= 0) return 1;
 
+  xSemaphoreTake(draw_mtx_, portMAX_DELAY);
   display_->draw_pixels_at(
       x, y, w, h,
       (const uint8_t *)p->pPixels,
@@ -609,6 +715,7 @@ int RemoteWebView::jpeg_draw_cb_(JPEGDRAW *p) {
       esphome::display::COLOR_BITNESS_565,
       rgb565_big_endian_
   );
+  xSemaphoreGive(draw_mtx_);
 
   return 1;
 }

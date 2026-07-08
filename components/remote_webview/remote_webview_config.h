@@ -6,10 +6,16 @@ namespace cfg {
 
 // Bump with every release so `dump_config` output and idf_component.yml agree
 // on what's actually flashed.
-inline constexpr const char *component_version = "1.3.3";
+inline constexpr const char *component_version = "1.4.0";
 
 // Decode task needs headroom for JPEGDEC + draw_pixels_at at high frame rates
 inline constexpr int decode_task_stack = 48 * 1024;
+// Worker 0 lives on core 1 (dedicated to decode, above everything there).
+inline constexpr int decode_task_prio_core1 = 6;
+// Worker 1 lives on core 0 with WiFi/lwIP/the WS client task (prio 5). Keep
+// it BELOW the WS task so receiving the next message always preempts
+// decoding the current one — it soaks up spare core-0 cycles only.
+inline constexpr int decode_task_prio_core0 = 4;
 // Under a sustained backlog, give the idle task (and thus the Task Watchdog)
 // a scheduling slice after this many back-to-back decoded messages.
 inline constexpr uint32_t decode_yield_every = 8;
