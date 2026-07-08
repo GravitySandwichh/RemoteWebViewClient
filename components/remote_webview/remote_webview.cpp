@@ -389,6 +389,15 @@ void RemoteWebView::decode_task_tramp_(void *arg) {
       self->process_packet_(self->reasm_pool_[m.slot], m.len);
       xQueueSend(self->q_free_, &m.slot, portMAX_DELAY);
     }
+    // xQueueReceive only yields when the queue is empty. During sustained
+    // animated content, frames can arrive faster than this task drains them,
+    // so it never blocks meaningfully and runs message after message at
+    // priority 6 — well above the idle task. Starve the idle task on this
+    // core long enough (a few seconds of continuous animation is plenty)
+    // and the ESP-IDF Task Watchdog (5s default, monitoring the idle tasks)
+    // panics and reboots the whole device. Force a scheduling point every
+    // iteration so idle always gets a slice regardless of backlog.
+    vTaskDelay(1);
   }
 }
 
