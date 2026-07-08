@@ -1,0 +1,265 @@
+substitutions:
+  initial_url: "http://192.168.0.75:8123/remote-displays"  #this should be the URL to your Home Assistant dashboard you want to display
+
+esphome:
+  name: "webview-display-1"
+  friendly_name: Webview Display 1
+  platformio_options:
+    board_build.flash_mode: dio
+  on_boot:
+    priority: -100.0
+    then:
+      - delay: 5s
+      - light.turn_on:
+          id: back_light
+          brightness: !lambda return int( id(sd_backlight_brightness).state )/ 100.0;
+      - script.execute: about_blank_stuck
+
+esp32:
+  board: esp32-s3-devkitc-1
+  variant: esp32s3
+  flash_size: 16MB
+  framework:
+    type: esp-idf
+    sdkconfig_options:
+      COMPILER_OPTIMIZATION_SIZE: "y"
+      CONFIG_ESP32S3_DEFAULT_CPU_FREQ_240: "y"
+      CONFIG_ESP32S3_DATA_CACHE_64KB: "y"
+      CONFIG_ESP32S3_DATA_CACHE_LINE_64B: "y"
+      CONFIG_SPIRAM_FETCH_INSTRUCTIONS: "y"
+      CONFIG_SPIRAM_RODATA: "y"
+    components:
+      - name: "espressif/esp_websocket_client"
+        ref: 1.5.0
+      - name: "bitbank2/jpegdec"
+        source: https://github.com/SleepinDevil/jpegdec-esphome
+        # yes I have also been experimenting with some optimisations on the JPEG Decoder
+        #source: https://github.com/strange-v/jpegdec-esphome
+
+psram:
+  mode: octal
+  speed: 80MHz
+
+external_components:
+  - source: github://strange-v/RemoteWebViewClient@main
+  #- source: github://SleepinDevil/RemoteWebViewClient@pr-url_packet-on_frame_update
+    refresh: 0s
+    components: [ remote_webview ]
+
+logger:
+  hardware_uart: UART0
+
+api:
+  #encryption:
+  #  key: "XXXXXXXXX"
+
+ota:
+  - platform: esphome
+    password: !secret ota_password
+    on_begin: # prevent screen flickering during OTA
+      - light.turn_off:
+          id: back_light
+          transition_length: 0s
+      - lambda: "id(back_light).loop();"
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+
+
+switch:
+  - platform: gpio
+    name: Relay 1
+    pin:
+      number: GPIO40
+      inverted: true
+  - platform: gpio
+    name: Relay 2
+    pin:
+      number: GPIO2
+      inverted: true
+  - platform: gpio
+    name: Relay 3
+    pin:
+      number: GPIO1
+      inverted: true
+
+button:
+  - platform: template
+    name: "Test on_frame_update trigger"
+    on_press:
+      then:
+      - remote_webview.trigger_on_frame_update:
+          id: rwv
+    entity_category: "diagnostic" 
+  - platform: template
+    name: "Test script for blank screen fix"
+    on_press:
+      then:
+      - script.execute: about_blank_stuck
+    entity_category: "diagnostic" 
+
+captive_portal:
+    
+spi:
+  clk_pin: GPIO48
+  mosi_pin: GPIO47
+
+i2c:
+  - id: bus_a
+    sda: GPIO19
+    scl:
+      number: 45
+      ignore_strapping_warning: true
+
+number:
+  - platform: template
+    name: Backlight Brightness
+    id: sd_backlight_brightness
+    optimistic: true
+    restore_value: true
+    min_value: 30
+    max_value: 100
+    initial_value: 70
+    step: 5
+    set_action:
+      then:
+      - light.turn_on:
+          id: back_light
+          brightness: !lambda return int(x)/ 100.0;
+      - script.execute: inactivity_timer
+
+display:
+  - platform: st7701s
+    show_test_card: False
+    update_interval: never
+    auto_clear_enabled: False
+    spi_mode: MODE3
+    data_rate: 2MHz
+    color_order: RGB
+    invert_colors: False
+    dimensions:
+      width: 480
+      height: 480
+    cs_pin: 39
+    de_pin: 18
+    hsync_pin: 16
+    vsync_pin: 17
+    pclk_pin: 21
+    pclk_frequency: 12MHz
+    pclk_inverted: False
+    hsync_pulse_width: 8
+    hsync_front_porch: 10
+    hsync_back_porch: 20
+    vsync_pulse_width: 8
+    vsync_front_porch: 10
+    vsync_back_porch: 10
+    init_sequence:
+      - 1
+      - [0xFF, 0x77, 0x01, 0x00, 0x00, 0x10]
+      - [0xCD, 0x00]
+    data_pins:
+      red: [11, 12, 13, 14, 0]
+      green: [8, 20, 3, 46, 9, 10]
+      blue: [4, 5, 6, 7, 15]
+
+touchscreen:
+  platform: gt911
+  transform:
+    mirror_x: false
+    mirror_y: false
+  i2c_id: bus_a
+  on_touch:
+    then:
+      - script.execute: inactivity_timer
+
+output:
+  - platform: ledc
+    pin: GPIO38
+    id: backlight_pwm
+    frequency: 150Hz
+    min_power: 0.01
+    zero_means_zero: true
+
+light:
+  - platform: monochromatic
+    output: backlight_pwm
+    name: "Display Backlight"
+    id: back_light
+    restore_mode: ALWAYS_ON
+    default_transition_length: 2s
+
+remote_webview:
+  id: rwv
+  server: 192.168.0.57:8081 # this is the URL for the server instance
+  url: ${initial_url}  # set url: "self-test" to initiate the self-test
+  #url: "self-test"
+  full_frame_tile_count: 2
+  tile_size: 32
+  full_frame_every: 10
+  min_frame_interval: 65 
+  # if you are using SleepinDevil/jpegdec-esphome, then you can try 60 min_frame_interval and jpeg_quality 95
+  max_bytes_per_msg: 61440
+  jpeg_quality: 95
+  on_frame_update:
+    then:
+      - script.execute: inactivity_timer
+  current_url_sensor:
+    id: current_url_sensor_id
+    name: "Remote Display Current URL"
+    on_value:
+      - logger.log:
+          format: "The screen just navigated to: %s"
+          args: [ 'x.c_str()' ]
+
+text:
+  - platform: template
+    id: rwv_url
+    name: "Load New URL"
+    optimistic: true
+    restore_value: false
+    mode: TEXT
+    min_length: 1
+    initial_value: ${initial_url}
+    set_action:
+      - lambda: |-
+          if (!id(rwv).open_url(std::string(x.c_str()))) {
+            id(rwv).set_url(std::string(x.c_str()));
+            ESP_LOGI("remote_webview", "URL queued (not connected): %s", x.c_str());
+          }
+
+script:
+  - id: inactivity_timer
+    mode: restart
+    then:
+      - light.turn_on: 
+          id: back_light
+          brightness: !lambda return int ( id (sd_backlight_brightness).state )/ 100.0;
+          transition_length: 0.5s
+      - delay: 10s
+      - light.dim_relative:
+          id: back_light
+          relative_brightness: -40%
+          transition_length: 3s
+          brightness_limits:
+            min_brightness: 30%
+  - id: about_blank_stuck
+    mode: restart
+    then:
+      - delay: 30s
+      - if: 
+          condition:
+            lambda: |-
+              std::string server_url = id(current_url_sensor_id).state;
+              ESP_LOGI("remote_webview", "URL Sensor Text:%s. Empty:%d. Length:%d.", server_url.c_str(), server_url.empty(), server_url.length() );
+              return (server_url.empty() || server_url.length() < 10 || server_url == "unknown" || server_url == "Unknown" );
+          then:
+            - logger.log: "Current displayed URL is 'Unknown', let's attempt to set it again."
+            - lambda: |-
+                if ( !id(rwv).open_url( "${initial_url}" ) ) {
+                  id(rwv).set_url("${initial_url}");
+                  ESP_LOGI("remote_webview", "URL queued (not connected): ${initial_url}");
+                }
+          else:
+            - logger.log: "Initial page load seems to have worked correctly."
+
