@@ -159,7 +159,11 @@ class RemoteWebView : public Component {
 
   static int jpeg_draw_cb_s_(JPEGDRAW *p);
   int jpeg_draw_cb_(JPEGDRAW *p);
-  JPEGDEC jd_;
+  // Heap-allocated (pinned to internal SRAM in setup()) rather than a by-value
+  // member: JPEGDEC carries ~30-40 KB of hot decode buffers, and as a member it
+  // pushed this whole object past ESP-IDF's "always internal" malloc threshold,
+  // landing the decoder's working set in slow, contended PSRAM.
+  JPEGDEC *jd_{nullptr};
 
   bool ws_send_touch_event_(proto::TouchType type, int x, int y, uint8_t pid);
   bool ws_send_keepalive_();

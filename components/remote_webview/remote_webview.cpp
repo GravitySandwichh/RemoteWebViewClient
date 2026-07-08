@@ -11,8 +11,11 @@
 #include "esp_heap_caps.h"
 #include "esp_websocket_client.h"
 #include "esp_efuse.h"
+#include "esp_memory_utils.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+
+#include <new>
 
 namespace esphome {
 namespace remote_webview {
@@ -97,6 +100,22 @@ void RemoteWebView::setup() {
       continue;
     }
     xQueueSend(q_free_, &i, 0);
+  }
+
+  // Pin the JPEG decoder's working state to internal SRAM. The self-test
+  // measured full-frame decode at ~53 ms with this state in PSRAM (where the
+  // panel's refresh DMA is also constantly reading); the decoder touches these
+  // buffers for every 8x8 block, so keeping them on-chip removes a large PSRAM
+  // round trip from the innermost decode loop. Falls back to the default heap
+  // if internal memory is tight — same behavior as before, just not faster.
+  jd_ = (JPEGDEC *) heap_caps_malloc(sizeof(JPEGDEC), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+  if (!jd_) jd_ = (JPEGDEC *) heap_caps_malloc(sizeof(JPEGDEC), MALLOC_CAP_8BIT);
+  if (jd_) {
+    new (jd_) JPEGDEC();  // value-init zeroes the decoder state
+    ESP_LOGI(TAG, "JPEGDEC state (%u bytes) in %s RAM", (unsigned) sizeof(JPEGDEC),
+             esp_ptr_internal(jd_) ? "internal" : "PSRAM");
+  } else {
+    ESP_LOGE(TAG, "Failed to allocate JPEGDEC state (%u bytes)", (unsigned) sizeof(JPEGDEC));
   }
 
   start_decode_task_();
@@ -384,20 +403,27 @@ void RemoteWebView::start_decode_task_() {
 void RemoteWebView::decode_task_tramp_(void *arg) {
   auto *self = reinterpret_cast<RemoteWebView*>(arg);
   WsMsg m;
+  uint32_t streak = 0;
   for (;;) {
-    if (xQueueReceive(self->q_decode_, &m, portMAX_DELAY) == pdTRUE) {
-      self->process_packet_(self->reasm_pool_[m.slot], m.len);
-      xQueueSend(self->q_free_, &m.slot, portMAX_DELAY);
+    if (xQueueReceive(self->q_decode_, &m, portMAX_DELAY) != pdTRUE) continue;
+    self->process_packet_(self->reasm_pool_[m.slot], m.len);
+    xQueueSend(self->q_free_, &m.slot, portMAX_DELAY);
+
+    // Watchdog protection: during sustained animation the queue can stay
+    // non-empty indefinitely, so this task (priority 6) would never block and
+    // the idle task — which the ESP-IDF Task Watchdog (5s) monitors — starves,
+    // panicking the device. But an unconditional vTaskDelay(1) per message
+    // costs up to a full tick each, which is real money for 1-2 ms partial
+    // tiles at 30fps. So: when the queue drains, the blocking receive above
+    // yields naturally and no delay is needed; only during an unbroken backlog
+    // hand idle a slice every few messages (worst case well under 200 ms
+    // between slices — far inside the 5 s watchdog window).
+    if (uxQueueMessagesWaiting(self->q_decode_) == 0) {
+      streak = 0;
+    } else if (++streak >= cfg::decode_yield_every) {
+      streak = 0;
+      vTaskDelay(1);
     }
-    // xQueueReceive only yields when the queue is empty. During sustained
-    // animated content, frames can arrive faster than this task drains them,
-    // so it never blocks meaningfully and runs message after message at
-    // priority 6 — well above the idle task. Starve the idle task on this
-    // core long enough (a few seconds of continuous animation is plenty)
-    // and the ESP-IDF Task Watchdog (5s default, monitoring the idle tasks)
-    // panics and reboots the whole device. Force a scheduling point every
-    // iteration so idle always gets a slice regardless of backlog.
-    vTaskDelay(1);
   }
 }
 
@@ -544,21 +570,23 @@ bool RemoteWebView::decode_jpeg_tile_to_lcd_(int16_t dst_x, int16_t dst_y, const
 }
 
 bool RemoteWebView::decode_jpeg_tile_software_(int16_t dst_x, int16_t dst_y, const uint8_t *data, size_t len) {
-  if (!jd_.openRAM((uint8_t*)data, (int)len, &RemoteWebView::jpeg_draw_cb_s_)) {
-    ESP_LOGE(TAG, "openRAM failed (len=%u) err=%d", (unsigned)len, jd_.getLastError());
+  if (!jd_) return false;
+
+  if (!jd_->openRAM((uint8_t*)data, (int)len, &RemoteWebView::jpeg_draw_cb_s_)) {
+    ESP_LOGE(TAG, "openRAM failed (len=%u) err=%d", (unsigned)len, jd_->getLastError());
     return false;
   }
 
-  jd_.setMaxOutputSize(8 * 2048);
-  jd_.setPixelType(rgb565_big_endian_ ? RGB565_BIG_ENDIAN : RGB565_LITTLE_ENDIAN);
+  jd_->setMaxOutputSize(8 * 2048);
+  jd_->setPixelType(rgb565_big_endian_ ? RGB565_BIG_ENDIAN : RGB565_LITTLE_ENDIAN);
 
-  const int rc = jd_.decode(dst_x, dst_y, 0);
+  const int rc = jd_->decode(dst_x, dst_y, 0);
   if (rc == 0) {
-    ESP_LOGE(TAG, "decode rc=%d err=%d", rc, jd_.getLastError());
-    jd_.close();
+    ESP_LOGE(TAG, "decode rc=%d err=%d", rc, jd_->getLastError());
+    jd_->close();
     return false;
   }
-  jd_.close();
+  jd_->close();
   return true;
 }
 
