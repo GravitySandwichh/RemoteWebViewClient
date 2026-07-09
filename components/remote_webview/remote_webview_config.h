@@ -6,7 +6,7 @@ namespace cfg {
 
 // Bump with every release so `dump_config` output and idf_component.yml agree
 // on what's actually flashed.
-inline constexpr const char *component_version = "1.4.5";
+inline constexpr const char *component_version = "1.5.0";
 
 // Per decode worker. Was 48KB ("headroom" inherited from the single-task
 // era with no measurement behind it); with two workers that ate 96KB of
@@ -17,17 +17,27 @@ inline constexpr const char *component_version = "1.4.5";
 inline constexpr int decode_task_stack = 32 * 1024;
 // Worker 0 lives on core 1 (dedicated to decode, above everything there).
 inline constexpr int decode_task_prio_core1 = 6;
-// Worker 1 lives on core 0 with WiFi/lwIP/the WS client task (prio 5). EQUAL
-// priority to the WS task, so FreeRTOS time-slices them per tick: both make
-// steady progress. It was originally 4 (strictly below), which let the WS
-// task starve the worker for hundreds of ms mid-message under load — it
-// would dequeue a message, stall before the frame barrier while newer frames
-// raced past on core 1, then drop it as stale, holding a reassembly slot
-// hostage the whole time. A stalled worker is worse than no worker.
-inline constexpr int decode_task_prio_core0 = 5;
-// Under a sustained backlog, give the idle task (and thus the Task Watchdog)
-// a scheduling slice after this many back-to-back decoded messages.
-inline constexpr uint32_t decode_yield_every = 8;
+// Worker 1 lives on core 0. Priority history matters here:
+//   - 4 (below the WS task, 5): starved for hundreds of ms mid-message,
+//     dropped frames as stale, held reassembly slots hostage.
+//   - 5 (equal to WS): still starved — the real preemptors were never the
+//     WS task but lwIP (18) and the WiFi driver (23), which own core 0
+//     exactly when frames flood in.
+//   - 19 (current): above lwIP, below the WiFi driver and esp_timer (22).
+//     The worker can only be preempted for brief radio-critical work, so it
+//     decodes its ~10ms strip uninterrupted; TCP ACK processing waits those
+//     ~10ms, which TCP absorbs without blinking. This is what makes two
+//     strips per core actually run in parallel — full-frame wall time is
+//     4 serial strip decodes (~44ms) single-core vs ~2 (~24-27ms) dual.
+//     The periodic decode_yield_every vTaskDelay below doubles as the valve
+//     that lets lwIP and the main loop breathe during sustained backlogs.
+inline constexpr int decode_task_prio_core0 = 19;
+// Under a sustained backlog, give lower-priority tasks (idle for the Task
+// Watchdog, and — for the priority-19 core-0 worker — lwIP and the main
+// loop) a scheduling slice after this many back-to-back decoded messages.
+// Tightened from 8 to 4 when worker 1 moved above lwIP: the valve has to
+// open often enough that TCP ACK processing never waits tens of ms.
+inline constexpr uint32_t decode_yield_every = 4;
 // WS task stack bumped for stability under high throughput
 inline constexpr int ws_task_stack = 12 * 1024;
 inline constexpr int ws_task_prio = 5;

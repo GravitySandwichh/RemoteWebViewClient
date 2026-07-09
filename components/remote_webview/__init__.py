@@ -74,10 +74,12 @@ CONFIG_SCHEMA = cv.Schema(
         cv.Optional(CONF_JPEG_QUALITY): cv.int_,
         cv.Optional(CONF_MAX_BYTES_PER_MSG): cv.int_,
         cv.Optional(CONF_BIG_ENDIAN): cv.boolean,
-        # Default False: measured on ESP32-S3, a second decode worker on core 0
-        # gets starved by WiFi/lwIP (prio 18-23) exactly when frames flood in,
-        # stalling mid-message and dropping tiles. Kept as an opt-in for
-        # platforms where core 0 isn't the radio core.
+        # Opt-in. As of v1.5.0 the core-0 worker runs at priority 19 (above
+        # lwIP, below the WiFi driver), which fixes the starvation that made
+        # earlier dual-core attempts drop tiles — but it also means decode
+        # briefly delays TCP/main-loop processing on core 0, so it stays
+        # opt-in until proven across more devices. Roughly halves full-frame
+        # wall time (4 serial strip decodes -> 2 per core in parallel).
         cv.Optional(CONF_DUAL_CORE_DECODE, default=False): cv.boolean,
         cv.Optional(CONF_ROTATION): validate_rotation,
         cv.Optional(CONF_ON_FRAME_UPDATE): automation.validate_automation(
