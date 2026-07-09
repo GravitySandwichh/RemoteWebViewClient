@@ -140,6 +140,11 @@ class RemoteWebView : public Component {
   // definitive tell for whether SIMD is active (SIMD ~10+ Mpix/s, scalar ~4).
   std::atomic<uint32_t> frame_px_{0};
   uint32_t last_heavy_log_ms_{0};
+  // Rate limiting for the pool-exhausted warning: it fires on the WS receive
+  // task, where a ~10ms UART log line per dropped message during an overload
+  // burst would stall receiving and deepen the very backlog being reported.
+  uint32_t last_pool_warn_ms_{0};
+  uint32_t pool_drops_since_warn_{0};
 
   static constexpr int kReasmPoolSize = cfg::decode_queue_depth;
   uint8_t      *reasm_pool_[kReasmPoolSize]{};

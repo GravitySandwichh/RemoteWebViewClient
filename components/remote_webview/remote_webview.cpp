@@ -395,7 +395,17 @@ void RemoteWebView::ws_event_handler_(void *handler_arg, esp_event_base_t, int32
         }
         int slot;
         if (!self_->q_free_ || xQueueReceive(self_->q_free_, &slot, 0) != pdTRUE) {
-          ESP_LOGW(TAG, "reassembly pool exhausted, dropping message");
+          // Rate-limited: this runs on the WS receive task during overload
+          // bursts, and an unthrottled ~10ms UART line per dropped message
+          // would stall receiving and worsen the very backlog it reports.
+          self_->pool_drops_since_warn_++;
+          const uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);
+          if (now_ms - self_->last_pool_warn_ms_ >= 1000) {
+            ESP_LOGW(TAG, "reassembly pool exhausted, dropped %lu message(s) in last 1s",
+                     (unsigned long)self_->pool_drops_since_warn_);
+            self_->last_pool_warn_ms_ = now_ms;
+            self_->pool_drops_since_warn_ = 0;
+          }
           break;
         }
         r->slot  = slot;
@@ -607,12 +617,19 @@ void RemoteWebView::process_frame_packet_(JPEGDEC *jd, const uint8_t *data, size
     // read slightly short. It feeds only the debug log, self-test averages,
     // and the (once-per-second-throttled) on_frame_update trigger — none of
     // which warrant a completion-tracking mechanism.
+    // Snapshot under the lock, log AFTER releasing it: a log line at 115200
+    // baud blocks its caller for ~10ms, and holding stats_mtx_ that long
+    // would stall the other worker's frame barrier for the duration.
+    bool log_heavy = false;
+    uint32_t lg_fid = 0, lg_wall = 0, lg_arrive = 0, lg_dec_us = 0, lg_draw_us = 0, lg_px = 0;
+    uint16_t lg_tiles = 0;
+    size_t lg_bytes = 0;
+
     xSemaphoreTake(stats_mtx_, portMAX_DELAY);
     const uint32_t time_ms = (esp_timer_get_time() - frame_start_us_) / 1000ULL;
     frame_stats_bytes_ += frame_bytes_;
     frame_stats_time_ += time_ms;
     frame_stats_count_++;
-    ESP_LOGD(TAG, "frame %lu: tiles %u (%u bytes) - %lu ms", frame_id_, frame_tiles_, frame_bytes_, time_ms);
 
     // Heavy-frame diagnostic (rate-limited): splits a slow frame's wall time
     // into waiting-for-arrival vs decode vs draw so the bottleneck is
@@ -620,23 +637,31 @@ void RemoteWebView::process_frame_packet_(JPEGDEC *jd, const uint8_t *data, size
     // last message of the frame reaching the decode queue (network/radio
     // pacing); decode includes draw (drawing happens inside the decoder's
     // callbacks); draw includes draw-mutex wait.
-    const uint32_t arrive_ms = (uint32_t)((frame_last_enq_us_ - frame_first_enq_us_) / 1000);
-    const uint32_t decode_us = frame_decode_us_.load(std::memory_order_relaxed);
-    const uint32_t draw_us   = frame_draw_us_.load(std::memory_order_relaxed);
-    const uint32_t px        = frame_px_.load(std::memory_order_relaxed);
     const uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);
     if (time_ms >= 25 && (now_ms - last_heavy_log_ms_) >= 1000) {
       last_heavy_log_ms_ = now_ms;
-      // px/(decode-draw) ~= raw decoder throughput: SIMD lands well above
-      // 8 Mpix/s, scalar around 3-5 — the definitive SIMD-active check.
-      const uint32_t pure_dec_us = (decode_us > draw_us) ? (decode_us - draw_us) : 1;
-      const uint32_t kpix_per_s = (uint32_t)((uint64_t)px * 1000000ULL / pure_dec_us / 1000ULL);
-      ESP_LOGI(TAG, "heavy frame %lu: wall=%lums arrive=%lums decode=%lums (draw=%lums) tiles=%u bytes=%u px=%lu rate=%lukpx/s",
-               (unsigned long)frame_id_, (unsigned long)time_ms, (unsigned long)arrive_ms,
-               (unsigned long)(decode_us / 1000), (unsigned long)(draw_us / 1000), frame_tiles_,
-               (unsigned)frame_bytes_, (unsigned long)px, (unsigned long)kpix_per_s);
+      log_heavy = true;
+      lg_fid    = frame_id_;
+      lg_wall   = time_ms;
+      lg_arrive = (uint32_t)((frame_last_enq_us_ - frame_first_enq_us_) / 1000);
+      lg_dec_us = frame_decode_us_.load(std::memory_order_relaxed);
+      lg_draw_us = frame_draw_us_.load(std::memory_order_relaxed);
+      lg_px     = frame_px_.load(std::memory_order_relaxed);
+      lg_tiles  = frame_tiles_;
+      lg_bytes  = frame_bytes_;
     }
     xSemaphoreGive(stats_mtx_);
+
+    if (log_heavy) {
+      // px/(decode-draw) ~= raw decoder throughput: SIMD lands well above
+      // 8 Mpix/s, scalar around 3-5 — the definitive SIMD-active check.
+      const uint32_t pure_dec_us = (lg_dec_us > lg_draw_us) ? (lg_dec_us - lg_draw_us) : 1;
+      const uint32_t kpix_per_s = (uint32_t)((uint64_t)lg_px * 1000000ULL / pure_dec_us / 1000ULL);
+      ESP_LOGI(TAG, "heavy frame %lu: wall=%lums arrive=%lums decode=%lums (draw=%lums) tiles=%u bytes=%u px=%lu rate=%lukpx/s",
+               (unsigned long)lg_fid, (unsigned long)lg_wall, (unsigned long)lg_arrive,
+               (unsigned long)(lg_dec_us / 1000), (unsigned long)(lg_draw_us / 1000), lg_tiles,
+               (unsigned)lg_bytes, (unsigned long)lg_px, (unsigned long)kpix_per_s);
+    }
 
     this->frame_update_pending_.store(true, std::memory_order_release);
   }
