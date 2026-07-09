@@ -6,7 +6,7 @@ namespace cfg {
 
 // Bump with every release so `dump_config` output and idf_component.yml agree
 // on what's actually flashed.
-inline constexpr const char *component_version = "1.4.3";
+inline constexpr const char *component_version = "1.4.4";
 
 // Per decode worker. Was 48KB ("headroom" inherited from the single-task
 // era with no measurement behind it); with two workers that ate 96KB of
