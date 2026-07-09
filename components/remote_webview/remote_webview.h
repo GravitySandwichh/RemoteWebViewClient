@@ -69,8 +69,9 @@ class RemoteWebView : public Component {
   // fragmenting it over long uptimes; a pool sized to the queue depth removes
   // allocator calls from the hot path entirely.
   struct WsMsg {
-    int    slot{-1};
-    size_t len{0};
+    int     slot{-1};
+    size_t  len{0};
+    int64_t t_enq_us{0};  // when the WS handler queued it — arrival timing
   };
   struct WsReasm {
     int slot{-1};
@@ -125,6 +126,17 @@ class RemoteWebView : public Component {
   uint32_t frame_stats_time_{0};
   uint32_t frame_stats_count_{0};
   size_t   frame_stats_bytes_{0};
+
+  // Per-frame timing breakdown for the heavy-frame diagnostic log:
+  // where does a multi-message frame's wall time go — waiting for messages
+  // to arrive (network/radio), decoding (Huffman+SIMD), or drawing into the
+  // PSRAM framebuffer? first/last enq guarded by stats_mtx_; the us counters
+  // are atomics because they accumulate from inside hot decode callbacks.
+  int64_t frame_first_enq_us_{0};
+  int64_t frame_last_enq_us_{0};
+  std::atomic<uint32_t> frame_decode_us_{0};
+  std::atomic<uint32_t> frame_draw_us_{0};
+  uint32_t last_heavy_log_ms_{0};
 
   static constexpr int kReasmPoolSize = cfg::decode_queue_depth;
   uint8_t      *reasm_pool_[kReasmPoolSize]{};
@@ -185,10 +197,10 @@ class RemoteWebView : public Component {
   static void ws_event_handler_(void *handler_arg, esp_event_base_t base, int32_t event_id, void *event_data);
   static void reasm_release_(RemoteWebView *self, WsReasm &r);
 
-  void process_packet_(JPEGDEC *jd, const uint8_t *data, size_t len);
-  void process_frame_packet_(JPEGDEC *jd, const uint8_t *data, size_t len);
+  void process_packet_(JPEGDEC *jd, const uint8_t *data, size_t len, int64_t t_enq_us);
+  void process_frame_packet_(JPEGDEC *jd, const uint8_t *data, size_t len, int64_t t_enq_us);
   void process_frame_stats_packet_(const uint8_t *data, size_t len);
-  bool frame_barrier_enter_(uint32_t frame_id, size_t msg_len, uint16_t tile_count);
+  bool frame_barrier_enter_(uint32_t frame_id, size_t msg_len, uint16_t tile_count, int64_t t_enq_us);
   void frame_barrier_exit_();
   bool decode_jpeg_tile_to_lcd_(JPEGDEC *jd, int16_t dst_x, int16_t dst_y, const uint8_t *data, size_t len);
   bool decode_jpeg_tile_software_(JPEGDEC *jd, int16_t dst_x, int16_t dst_y, const uint8_t *data, size_t len);

@@ -389,6 +389,7 @@ void RemoteWebView::ws_event_handler_(void *handler_arg, esp_event_base_t, int32
       if (r->filled == r->total) {
         WsMsg m;
         m.slot = r->slot; m.len = r->total;
+        m.t_enq_us = esp_timer_get_time();
         r->slot = -1; r->total = 0; r->filled = 0;
         if (!self_->q_decode_ || xQueueSend(self_->q_decode_, &m, 0) != pdTRUE) {
           ESP_LOGW(TAG, "decode queue full, dropping packet");
@@ -445,7 +446,7 @@ void RemoteWebView::decode_task_tramp_(void *arg) {
   uint32_t streak = 0;
   for (;;) {
     if (xQueueReceive(self->q_decode_, &m, portMAX_DELAY) != pdTRUE) continue;
-    self->process_packet_(ctx->jd, self->reasm_pool_[m.slot], m.len);
+    self->process_packet_(ctx->jd, self->reasm_pool_[m.slot], m.len, m.t_enq_us);
     xQueueSend(self->q_free_, &m.slot, portMAX_DELAY);
 
     // Watchdog protection: during sustained animation the queue can stay
@@ -466,13 +467,13 @@ void RemoteWebView::decode_task_tramp_(void *arg) {
   }
 }
 
-void RemoteWebView::process_packet_(JPEGDEC *jd, const uint8_t *data, size_t len) {
+void RemoteWebView::process_packet_(JPEGDEC *jd, const uint8_t *data, size_t len, int64_t t_enq_us) {
   if (!data || len == 0) return;
 
   const proto::MsgType type = (proto::MsgType)data[0];
   switch (type) {
     case proto::MsgType::Frame:
-      process_frame_packet_(jd, data, len);
+      process_frame_packet_(jd, data, len, t_enq_us);
       break;
     case proto::MsgType::FrameStats:
       process_frame_stats_packet_(data, len);
@@ -499,12 +500,14 @@ void RemoteWebView::process_packet_(JPEGDEC *jd, const uint8_t *data, size_t len
 // the other worker meanwhile dequeues N+2 and advances past it. Drawing the
 // stale N+1 tiles would overwrite newer pixels; dropping them merely leaves
 // that region one frame behind until the next update or drift sweep.
-bool RemoteWebView::frame_barrier_enter_(uint32_t frame_id, size_t msg_len, uint16_t tile_count) {
+bool RemoteWebView::frame_barrier_enter_(uint32_t frame_id, size_t msg_len, uint16_t tile_count, int64_t t_enq_us) {
   for (;;) {
     xSemaphoreTake(stats_mtx_, portMAX_DELAY);
     if (frame_id == frame_id_) {
       frame_bytes_ += msg_len;
       frame_tiles_ += tile_count;
+      if (t_enq_us < frame_first_enq_us_) frame_first_enq_us_ = t_enq_us;
+      if (t_enq_us > frame_last_enq_us_) frame_last_enq_us_ = t_enq_us;
       barrier_inflight_++;
       xSemaphoreGive(stats_mtx_);
       return true;
@@ -519,6 +522,10 @@ bool RemoteWebView::frame_barrier_enter_(uint32_t frame_id, size_t msg_len, uint
       frame_tiles_ = tile_count;
       frame_bytes_ = msg_len;
       frame_start_us_ = esp_timer_get_time();
+      frame_first_enq_us_ = t_enq_us;
+      frame_last_enq_us_ = t_enq_us;
+      frame_decode_us_.store(0, std::memory_order_relaxed);
+      frame_draw_us_.store(0, std::memory_order_relaxed);
       barrier_inflight_++;
       xSemaphoreGive(stats_mtx_);
       return true;
@@ -534,7 +541,7 @@ void RemoteWebView::frame_barrier_exit_() {
   xSemaphoreGive(stats_mtx_);
 }
 
-void RemoteWebView::process_frame_packet_(JPEGDEC *jd, const uint8_t *data, size_t len)
+void RemoteWebView::process_frame_packet_(JPEGDEC *jd, const uint8_t *data, size_t len, int64_t t_enq_us)
 {
   if (!data || len < sizeof(proto::FrameHeader)) return;
 
@@ -542,7 +549,7 @@ void RemoteWebView::process_frame_packet_(JPEGDEC *jd, const uint8_t *data, size
   size_t off = 0;
   if (!proto::parse_frame_header(data, len, fi, off)) return;
 
-  if (!frame_barrier_enter_(fi.frame_id, len, fi.tile_count))
+  if (!frame_barrier_enter_(fi.frame_id, len, fi.tile_count, t_enq_us))
     return;  // stale frame dropped — no inflight slot was taken
 
   for (uint16_t i = 0; i < fi.tile_count; i++) {
@@ -578,6 +585,23 @@ void RemoteWebView::process_frame_packet_(JPEGDEC *jd, const uint8_t *data, size
     frame_stats_time_ += time_ms;
     frame_stats_count_++;
     ESP_LOGD(TAG, "frame %lu: tiles %u (%u bytes) - %lu ms", frame_id_, frame_tiles_, frame_bytes_, time_ms);
+
+    // Heavy-frame diagnostic (rate-limited): splits a slow frame's wall time
+    // into waiting-for-arrival vs decode vs draw so the bottleneck is
+    // measurable instead of guessed. arrive = spread between the first and
+    // last message of the frame reaching the decode queue (network/radio
+    // pacing); decode includes draw (drawing happens inside the decoder's
+    // callbacks); draw includes draw-mutex wait.
+    const uint32_t arrive_ms = (uint32_t)((frame_last_enq_us_ - frame_first_enq_us_) / 1000);
+    const uint32_t decode_ms = frame_decode_us_.load(std::memory_order_relaxed) / 1000;
+    const uint32_t draw_ms   = frame_draw_us_.load(std::memory_order_relaxed) / 1000;
+    const uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);
+    if (time_ms >= 25 && (now_ms - last_heavy_log_ms_) >= 1000) {
+      last_heavy_log_ms_ = now_ms;
+      ESP_LOGI(TAG, "heavy frame %lu: wall=%lums arrive=%lums decode=%lums (draw=%lums) tiles=%u bytes=%u",
+               (unsigned long)frame_id_, (unsigned long)time_ms, (unsigned long)arrive_ms,
+               (unsigned long)decode_ms, (unsigned long)draw_ms, frame_tiles_, (unsigned)frame_bytes_);
+    }
     xSemaphoreGive(stats_mtx_);
 
     this->frame_update_pending_.store(true, std::memory_order_release);
@@ -677,7 +701,11 @@ bool RemoteWebView::decode_jpeg_tile_software_(JPEGDEC *jd, int16_t dst_x, int16
   jd->setMaxOutputSize(8 * 2048);
   jd->setPixelType(rgb565_big_endian_ ? RGB565_BIG_ENDIAN : RGB565_LITTLE_ENDIAN);
 
+  const int64_t t0 = esp_timer_get_time();
   const int rc = jd->decode(dst_x, dst_y, 0);
+  // Includes time spent in draw callbacks (drawing happens inside decode);
+  // the heavy-frame log reports draw separately so the two can be split.
+  frame_decode_us_.fetch_add((uint32_t)(esp_timer_get_time() - t0), std::memory_order_relaxed);
   if (rc == 0) {
     ESP_LOGE(TAG, "decode rc=%d err=%d", rc, jd->getLastError());
     jd->close();
@@ -707,6 +735,7 @@ int RemoteWebView::jpeg_draw_cb_(JPEGDRAW *p) {
   if (y + h > display_height_) h = display_height_ - y;
   if (w <= 0 || h <= 0) return 1;
 
+  const int64_t t0 = esp_timer_get_time();
   xSemaphoreTake(draw_mtx_, portMAX_DELAY);
   display_->draw_pixels_at(
       x, y, w, h,
@@ -716,6 +745,9 @@ int RemoteWebView::jpeg_draw_cb_(JPEGDRAW *p) {
       rgb565_big_endian_
   );
   xSemaphoreGive(draw_mtx_);
+  // Includes any wait on draw_mtx_, so cross-worker draw contention shows
+  // up here rather than hiding in the decode number.
+  frame_draw_us_.fetch_add((uint32_t)(esp_timer_get_time() - t0), std::memory_order_relaxed);
 
   return 1;
 }
