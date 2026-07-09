@@ -6,10 +6,15 @@ namespace cfg {
 
 // Bump with every release so `dump_config` output and idf_component.yml agree
 // on what's actually flashed.
-inline constexpr const char *component_version = "1.4.1";
+inline constexpr const char *component_version = "1.4.2";
 
-// Decode task needs headroom for JPEGDEC + draw_pixels_at at high frame rates
-inline constexpr int decode_task_stack = 48 * 1024;
+// Per decode worker. Was 48KB ("headroom" inherited from the single-task
+// era with no measurement behind it); with two workers that ate 96KB of
+// internal SRAM and starved esp_websocket_client_init's ~60KB of rx/tx
+// buffers at boot — the v1.4.1 boot loop. The decode call graph is shallow
+// (iterative JPEGDEC -> draw callback -> esp_lcd memcpy, plus log
+// formatting), so 32KB is still several times the realistic worst case.
+inline constexpr int decode_task_stack = 32 * 1024;
 // Worker 0 lives on core 1 (dedicated to decode, above everything there).
 inline constexpr int decode_task_prio_core1 = 6;
 // Worker 1 lives on core 0 with WiFi/lwIP/the WS client task (prio 5). Keep

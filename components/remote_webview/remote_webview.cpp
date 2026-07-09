@@ -133,6 +133,10 @@ void RemoteWebView::setup() {
   start_decode_tasks_();
   start_ws_task_();
 
+  ESP_LOGI(TAG, "setup done, free heap: internal=%u psram=%u",
+           (unsigned) heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+           (unsigned) heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+
   if (touch_) {
     touch_listener_ = new RemoteWebViewTouchListener(this);
     touch_->register_listener(touch_listener_);
@@ -286,10 +290,32 @@ void RemoteWebView::ws_task_tramp_(void *arg) {
   cfg_ws.buffer_size          = cfg::ws_buffer_size;
   cfg_ws.disable_auto_reconnect = false;
 
+  // Never ESP_ERROR_CHECK (i.e. abort) on client setup: init allocates the
+  // client and its ~2x30KB rx/tx buffers from internal SRAM, and a failure
+  // here is almost always transient memory pressure right after WiFi comes
+  // up. Aborting turned that into a reboot loop (each boot hit the same
+  // pressure at the same moment); retrying quietly succeeds a few seconds
+  // later once startup allocations settle.
   WsReasm reasm{};
-  esp_websocket_client_handle_t client = esp_websocket_client_init(&cfg_ws);
-  ESP_ERROR_CHECK(esp_websocket_register_events(client, WEBSOCKET_EVENT_ANY, ws_event_handler_, &reasm));
-  ESP_ERROR_CHECK(esp_websocket_client_start(client));
+  esp_websocket_client_handle_t client = nullptr;
+  for (;;) {
+    client = esp_websocket_client_init(&cfg_ws);
+    if (client) {
+      const esp_err_t err = esp_websocket_register_events(client, WEBSOCKET_EVENT_ANY, ws_event_handler_, &reasm);
+      if (err == ESP_OK) break;
+      ESP_LOGE(TAG, "[ws] register_events failed: 0x%x", (unsigned) err);
+      esp_websocket_client_destroy(client);
+      client = nullptr;
+    } else {
+      ESP_LOGE(TAG, "[ws] client init failed (free internal heap: %u bytes) — retrying",
+               (unsigned) heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+    }
+    vTaskDelay(pdMS_TO_TICKS(3000));
+  }
+  while (esp_websocket_client_start(client) != ESP_OK) {
+    ESP_LOGE(TAG, "[ws] client start failed — retrying");
+    vTaskDelay(pdMS_TO_TICKS(3000));
+  }
 
   for (;;) {
     vTaskDelay(pdMS_TO_TICKS(5000));
