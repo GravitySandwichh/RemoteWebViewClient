@@ -136,6 +136,9 @@ class RemoteWebView : public Component {
   int64_t frame_last_enq_us_{0};
   std::atomic<uint32_t> frame_decode_us_{0};
   std::atomic<uint32_t> frame_draw_us_{0};
+  // Decoded pixels this frame — px/decode_ms gives decoder throughput, the
+  // definitive tell for whether SIMD is active (SIMD ~10+ Mpix/s, scalar ~4).
+  std::atomic<uint32_t> frame_px_{0};
   uint32_t last_heavy_log_ms_{0};
 
   static constexpr int kReasmPoolSize = cfg::decode_queue_depth;

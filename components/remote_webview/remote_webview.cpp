@@ -552,6 +552,7 @@ bool RemoteWebView::frame_barrier_enter_(uint32_t frame_id, size_t msg_len, uint
       frame_last_enq_us_ = t_enq_us;
       frame_decode_us_.store(0, std::memory_order_relaxed);
       frame_draw_us_.store(0, std::memory_order_relaxed);
+      frame_px_.store(0, std::memory_order_relaxed);
       barrier_inflight_++;
       xSemaphoreGive(stats_mtx_);
       return true;
@@ -593,6 +594,7 @@ void RemoteWebView::process_frame_packet_(JPEGDEC *jd, const uint8_t *data, size
     }
 
     if (fi.enc == proto::Encoding::JPEG && th.dlen) {
+      frame_px_.fetch_add((uint32_t)th.w * th.h, std::memory_order_relaxed);
       decode_jpeg_tile_to_lcd_(jd, (int16_t)th.x, (int16_t)th.y, data + off, th.dlen);
     }
 
@@ -619,14 +621,20 @@ void RemoteWebView::process_frame_packet_(JPEGDEC *jd, const uint8_t *data, size
     // pacing); decode includes draw (drawing happens inside the decoder's
     // callbacks); draw includes draw-mutex wait.
     const uint32_t arrive_ms = (uint32_t)((frame_last_enq_us_ - frame_first_enq_us_) / 1000);
-    const uint32_t decode_ms = frame_decode_us_.load(std::memory_order_relaxed) / 1000;
-    const uint32_t draw_ms   = frame_draw_us_.load(std::memory_order_relaxed) / 1000;
+    const uint32_t decode_us = frame_decode_us_.load(std::memory_order_relaxed);
+    const uint32_t draw_us   = frame_draw_us_.load(std::memory_order_relaxed);
+    const uint32_t px        = frame_px_.load(std::memory_order_relaxed);
     const uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);
     if (time_ms >= 25 && (now_ms - last_heavy_log_ms_) >= 1000) {
       last_heavy_log_ms_ = now_ms;
-      ESP_LOGI(TAG, "heavy frame %lu: wall=%lums arrive=%lums decode=%lums (draw=%lums) tiles=%u bytes=%u",
+      // px/(decode-draw) ~= raw decoder throughput: SIMD lands well above
+      // 8 Mpix/s, scalar around 3-5 — the definitive SIMD-active check.
+      const uint32_t pure_dec_us = (decode_us > draw_us) ? (decode_us - draw_us) : 1;
+      const uint32_t kpix_per_s = (uint32_t)((uint64_t)px * 1000000ULL / pure_dec_us / 1000ULL);
+      ESP_LOGI(TAG, "heavy frame %lu: wall=%lums arrive=%lums decode=%lums (draw=%lums) tiles=%u bytes=%u px=%lu rate=%lukpx/s",
                (unsigned long)frame_id_, (unsigned long)time_ms, (unsigned long)arrive_ms,
-               (unsigned long)decode_ms, (unsigned long)draw_ms, frame_tiles_, (unsigned)frame_bytes_);
+               (unsigned long)(decode_us / 1000), (unsigned long)(draw_us / 1000), frame_tiles_,
+               (unsigned)frame_bytes_, (unsigned long)px, (unsigned long)kpix_per_s);
     }
     xSemaphoreGive(stats_mtx_);
 

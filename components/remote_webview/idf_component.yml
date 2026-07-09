@@ -1,5 +1,5 @@
 name: remote_webview
-version: "1.4.2"
+version: "1.4.3"
 dependencies:
   - espressif/esp_websocket_client
   - espressif/esp-dsp
