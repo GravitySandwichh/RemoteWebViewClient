@@ -10,7 +10,12 @@ constexpr uint8_t kFlafLastOfFrame = 1u<<0;
 constexpr uint8_t kFlagIsFullFrame = 1u<<1;
 
 enum class MsgType   : uint8_t { Unknown = 0, Frame = 1, Touch = 2, FrameStats = 3, OpenURL = 4, Keepalive = 5, CurrentURL = 6 };
-enum class Encoding  : uint8_t { Unknown = 0, PNG = 1, JPEG = 2, RAW565 = 3, RAW565_RLE = 4, RAW565_LZ4 = 5 };
+// JPEG_HALF: tile header (x,y,w,h) describes the SCREEN rect, but the JPEG
+// payload is encoded at half resolution (w/2 x h/2); the client decodes it
+// and pixel-doubles while drawing. Used for scene-cut full frames, where a
+// briefly softer transition (sharpened by the idle refinement within ~1s)
+// buys a repaint that fits the 33ms/30fps budget.
+enum class Encoding  : uint8_t { Unknown = 0, PNG = 1, JPEG = 2, RAW565 = 3, RAW565_RLE = 4, RAW565_LZ4 = 5, JPEG_HALF = 6 };
 enum class TouchType : uint8_t { Unknown = 0, Down = 1, Move = 2, Up = 3 };
 
 #if defined(__GNUC__)

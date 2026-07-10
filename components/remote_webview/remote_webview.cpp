@@ -105,6 +105,15 @@ void RemoteWebView::setup() {
   draw_mtx_ = xSemaphoreCreateMutex();
   stats_mtx_ = xSemaphoreCreateMutex();
 
+  // Pixel-doubling staging buffer for half-resolution scene-cut tiles
+  // (Encoding::JPEG_HALF); shared between workers, guarded by draw_mtx_.
+  scale_buf_ = (uint16_t *) heap_caps_malloc(kScaleBufPixels * sizeof(uint16_t),
+                                             MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+  if (!scale_buf_)
+    scale_buf_ = (uint16_t *) heap_caps_malloc(kScaleBufPixels * sizeof(uint16_t), MALLOC_CAP_8BIT);
+  if (!scale_buf_)
+    ESP_LOGE(TAG, "Failed to allocate scale buffer; JPEG_HALF tiles will be skipped");
+
   // Decide the worker count with staged fallbacks: dual-core can be disabled
   // from YAML, is never used with the P4 hardware decoder (hw_dec_ and its
   // buffers are shared, not thread-safe), and degrades back to one worker if
@@ -482,7 +491,7 @@ void RemoteWebView::decode_task_tramp_(void *arg) {
   uint32_t streak = 0;
   for (;;) {
     if (xQueueReceive(self->q_decode_, &m, portMAX_DELAY) != pdTRUE) continue;
-    self->process_packet_(ctx->jd, self->reasm_pool_[m.slot], m.len, m.t_enq_us);
+    self->process_packet_(ctx, self->reasm_pool_[m.slot], m.len, m.t_enq_us);
     xQueueSend(self->q_free_, &m.slot, portMAX_DELAY);
 
     // Watchdog protection: during sustained animation the queue can stay
@@ -503,13 +512,13 @@ void RemoteWebView::decode_task_tramp_(void *arg) {
   }
 }
 
-void RemoteWebView::process_packet_(JPEGDEC *jd, const uint8_t *data, size_t len, int64_t t_enq_us) {
+void RemoteWebView::process_packet_(DecodeWorker *wk, const uint8_t *data, size_t len, int64_t t_enq_us) {
   if (!data || len == 0) return;
 
   const proto::MsgType type = (proto::MsgType)data[0];
   switch (type) {
     case proto::MsgType::Frame:
-      process_frame_packet_(jd, data, len, t_enq_us);
+      process_frame_packet_(wk, data, len, t_enq_us);
       break;
     case proto::MsgType::FrameStats:
       process_frame_stats_packet_(data, len);
@@ -578,7 +587,7 @@ void RemoteWebView::frame_barrier_exit_() {
   xSemaphoreGive(stats_mtx_);
 }
 
-void RemoteWebView::process_frame_packet_(JPEGDEC *jd, const uint8_t *data, size_t len, int64_t t_enq_us)
+void RemoteWebView::process_frame_packet_(DecodeWorker *wk, const uint8_t *data, size_t len, int64_t t_enq_us)
 {
   if (!data || len < sizeof(proto::FrameHeader)) return;
 
@@ -588,6 +597,8 @@ void RemoteWebView::process_frame_packet_(JPEGDEC *jd, const uint8_t *data, size
 
   if (!frame_barrier_enter_(fi.frame_id, len, fi.tile_count, t_enq_us))
     return;  // stale frame dropped — no inflight slot was taken
+
+  const bool scale2x = (fi.enc == proto::Encoding::JPEG_HALF);
 
   for (uint16_t i = 0; i < fi.tile_count; i++) {
     proto::TileHeader th{};
@@ -603,9 +614,9 @@ void RemoteWebView::process_frame_packet_(JPEGDEC *jd, const uint8_t *data, size
       continue;
     }
 
-    if (fi.enc == proto::Encoding::JPEG && th.dlen) {
+    if ((fi.enc == proto::Encoding::JPEG || scale2x) && th.dlen) {
       frame_px_.fetch_add((uint32_t)th.w * th.h, std::memory_order_relaxed);
-      decode_jpeg_tile_to_lcd_(jd, (int16_t)th.x, (int16_t)th.y, data + off, th.dlen);
+      decode_jpeg_tile_to_lcd_(wk, (int16_t)th.x, (int16_t)th.y, data + off, th.dlen, scale2x);
     }
 
     off += th.dlen;
@@ -694,16 +705,19 @@ void RemoteWebView::process_frame_stats_packet_(const uint8_t *data, size_t len)
   xSemaphoreGive(ws_send_mtx_);
 }
 
-bool RemoteWebView::decode_jpeg_tile_to_lcd_(JPEGDEC *jd, int16_t dst_x, int16_t dst_y, const uint8_t *data, size_t len) {
+bool RemoteWebView::decode_jpeg_tile_to_lcd_(DecodeWorker *wk, int16_t dst_x, int16_t dst_y, const uint8_t *data, size_t len, bool scale2x) {
   if (!data || !len) return false;
 
 #if REMOTE_WEBVIEW_HW_JPEG
   // Note: the HW decoder and its buffers are shared, which is why setup()
   // caps decode_workers_ at 1 when REMOTE_WEBVIEW_HW_JPEG is enabled.
-  if (hw_dec_ && hw_decode_input_buf_ && hw_decode_output_buf_) {
+  // Half-res tiles always take the software path (the HW decoder has no
+  // pixel-doubling output stage) — on P4 the HW decoder is fast enough that
+  // the server shouldn't be configured to send JPEG_HALF anyway.
+  if (!scale2x && hw_dec_ && hw_decode_input_buf_ && hw_decode_output_buf_) {
     jpeg_decode_picture_info_t hdr{};
     if (jpeg_decoder_get_info(data, (uint32_t)len, &hdr) != ESP_OK || !hdr.width || !hdr.height) {
-      return decode_jpeg_tile_software_(jd, dst_x, dst_y, data, len);
+      return decode_jpeg_tile_software_(wk, dst_x, dst_y, data, len, scale2x);
     }
 
     const int aligned_w = (hdr.width  + 15) & ~15;
@@ -712,12 +726,12 @@ bool RemoteWebView::decode_jpeg_tile_to_lcd_(JPEGDEC *jd, int16_t dst_x, int16_t
 
     if (aligned_w != (int)hdr.width) {
       ESP_LOGW(TAG, "jpeg dimensions not aligned: %u x %u", (unsigned)hdr.width, (unsigned)hdr.height);
-      return decode_jpeg_tile_software_(jd, dst_x, dst_y, data, len);
+      return decode_jpeg_tile_software_(wk, dst_x, dst_y, data, len, scale2x);
     }
 
     if (len > hw_decode_input_size_ || out_sz > hw_decode_output_size_) {
       ESP_LOGW(TAG, "tile too large for HW decoder buffers");
-      return decode_jpeg_tile_software_(jd, dst_x, dst_y, data, len);
+      return decode_jpeg_tile_software_(wk, dst_x, dst_y, data, len, scale2x);
     }
 
     jpeg_decode_cfg_t jcfg{};
@@ -732,7 +746,7 @@ bool RemoteWebView::decode_jpeg_tile_to_lcd_(JPEGDEC *jd, int16_t dst_x, int16_t
                                         hw_decode_output_buf_, (uint32_t)hw_decode_output_size_, &written);
 
     if (dr != ESP_OK) {
-      return decode_jpeg_tile_software_(jd, dst_x, dst_y, data, len);
+      return decode_jpeg_tile_software_(wk, dst_x, dst_y, data, len, scale2x);
     }
 
     xSemaphoreTake(draw_mtx_, portMAX_DELAY);
@@ -746,22 +760,32 @@ bool RemoteWebView::decode_jpeg_tile_to_lcd_(JPEGDEC *jd, int16_t dst_x, int16_t
   }
 #endif  // REMOTE_WEBVIEW_HW_JPEG
 
-  return decode_jpeg_tile_software_(jd, dst_x, dst_y, data, len);
+  return decode_jpeg_tile_software_(wk, dst_x, dst_y, data, len, scale2x);
 }
 
-bool RemoteWebView::decode_jpeg_tile_software_(JPEGDEC *jd, int16_t dst_x, int16_t dst_y, const uint8_t *data, size_t len) {
+bool RemoteWebView::decode_jpeg_tile_software_(DecodeWorker *wk, int16_t dst_x, int16_t dst_y, const uint8_t *data, size_t len, bool scale2x) {
+  JPEGDEC *jd = wk ? wk->jd : nullptr;
   if (!jd) return false;
+  if (scale2x && !scale_buf_) return false;  // no staging buffer — skip rather than draw wrong
 
   if (!jd->openRAM((uint8_t*)data, (int)len, &RemoteWebView::jpeg_draw_cb_s_)) {
     ESP_LOGE(TAG, "openRAM failed (len=%u) err=%d", (unsigned)len, jd->getLastError());
     return false;
   }
 
+  wk->dst_x = dst_x;
+  wk->dst_y = dst_y;
+  wk->scale2x = scale2x;
+  jd->setUserPointer(wk);
+
   jd->setMaxOutputSize(8 * 2048);
   jd->setPixelType(rgb565_big_endian_ ? RGB565_BIG_ENDIAN : RGB565_LITTLE_ENDIAN);
 
   const int64_t t0 = esp_timer_get_time();
-  const int rc = jd->decode(dst_x, dst_y, 0);
+  // Half-res tiles decode at origin; the draw callback maps each chunk to
+  // dst + 2*local while doubling. Full-res tiles bake dst into the decode
+  // so p->x/p->y arrive as absolute screen coordinates (as always).
+  const int rc = scale2x ? jd->decode(0, 0, 0) : jd->decode(dst_x, dst_y, 0);
   // Includes time spent in draw callbacks (drawing happens inside decode);
   // the heavy-frame log reports draw separately so the two can be split.
   frame_decode_us_.fetch_add((uint32_t)(esp_timer_get_time() - t0), std::memory_order_relaxed);
@@ -775,7 +799,9 @@ bool RemoteWebView::decode_jpeg_tile_software_(JPEGDEC *jd, int16_t dst_x, int16
 }
 
 int RemoteWebView::jpeg_draw_cb_s_(JPEGDRAW *p) {
-  return self_ ? self_->jpeg_draw_cb_(p) : 0;
+  auto *wk = reinterpret_cast<DecodeWorker *>(p->pUser);
+  if (!wk || !wk->rwv) return 0;
+  return wk->scale2x ? wk->rwv->jpeg_draw_scaled_(wk, p) : wk->rwv->jpeg_draw_cb_(wk, p);
 }
 
 // Runs inside JPEGDEC's decode loop on whichever worker owns the decode.
@@ -786,7 +812,7 @@ int RemoteWebView::jpeg_draw_cb_s_(JPEGDRAW *p) {
 // the PSRAM bus is a single shared resource, so parallel draws would
 // contend head-to-head anyway — the parallel win lives in the decode
 // (Huffman + SIMD) that happens between these callbacks.
-int RemoteWebView::jpeg_draw_cb_(JPEGDRAW *p) {
+int RemoteWebView::jpeg_draw_cb_(DecodeWorker *wk, JPEGDRAW *p) {
   int32_t x = p->x, y = p->y, w = p->iWidth, h = p->iHeight;
 
   if (x >= display_width_ || y >= display_height_) return 1;
@@ -806,6 +832,59 @@ int RemoteWebView::jpeg_draw_cb_(JPEGDRAW *p) {
   xSemaphoreGive(draw_mtx_);
   // Includes any wait on draw_mtx_, so cross-worker draw contention shows
   // up here rather than hiding in the decode number.
+  frame_draw_us_.fetch_add((uint32_t)(esp_timer_get_time() - t0), std::memory_order_relaxed);
+
+  return 1;
+}
+
+// Half-resolution (Encoding::JPEG_HALF) draw path: the decoded chunk is in
+// half-res space at (p->x, p->y) relative to the tile origin; it lands on
+// screen at wk->dst + 2*local, pixel-doubled 2x2 through scale_buf_. The
+// pixels pass through unchanged (already RGB565 in panel byte order), so
+// doubling is pure writes. scale_buf_ is shared and only touched while
+// holding draw_mtx_.
+int RemoteWebView::jpeg_draw_scaled_(DecodeWorker *wk, JPEGDRAW *p) {
+  const int32_t sx = (int32_t)wk->dst_x + p->x * 2;
+  const int32_t sy = (int32_t)wk->dst_y + p->y * 2;
+  const int32_t w = p->iWidth, h = p->iHeight;
+
+  if (sx >= display_width_ || sy >= display_height_ || w <= 0 || h <= 0) return 1;
+  int32_t wout = w * 2, hout = h * 2;
+  if (sx + wout > display_width_) wout = display_width_ - sx;
+  if (sy + hout > display_height_) hout = display_height_ - sy;
+  if (wout <= 0 || hout <= 0) return 1;
+
+  const int64_t t0 = esp_timer_get_time();
+  xSemaphoreTake(draw_mtx_, portMAX_DELAY);
+
+  // Expand into the staging buffer in slabs that fit it, drawing each slab.
+  // With 2048-px decode chunks a slab is always the whole chunk; the loop
+  // only matters if a future decoder delivers bigger chunks.
+  const int32_t max_rows_per_slab = (int32_t)(kScaleBufPixels / (size_t)wout) & ~1;  // even
+  for (int32_t row0 = 0; row0 < hout; row0 += max_rows_per_slab) {
+    const int32_t rows = ((hout - row0) < max_rows_per_slab) ? (hout - row0) : max_rows_per_slab;
+    for (int32_t r = 0; r < rows; r++) {
+      const int32_t src_r = (row0 + r) / 2;
+      const uint16_t *src = p->pPixels + (size_t)src_r * w;
+      uint16_t *d = scale_buf_ + (size_t)r * wout;
+      const int32_t pairs = wout / 2;
+      for (int32_t c = 0; c < pairs; c++) {
+        const uint16_t v = src[c];
+        d[2 * c] = v;
+        d[2 * c + 1] = v;
+      }
+      if (wout & 1) d[wout - 1] = src[pairs];
+    }
+    display_->draw_pixels_at(
+        sx, sy + row0, wout, rows,
+        (const uint8_t *)scale_buf_,
+        esphome::display::COLOR_ORDER_RGB,
+        esphome::display::COLOR_BITNESS_565,
+        rgb565_big_endian_
+    );
+  }
+
+  xSemaphoreGive(draw_mtx_);
   frame_draw_us_.fetch_add((uint32_t)(esp_timer_get_time() - t0), std::memory_order_relaxed);
 
   return 1;

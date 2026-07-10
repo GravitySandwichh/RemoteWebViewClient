@@ -165,6 +165,13 @@ class RemoteWebView : public Component {
     RemoteWebView *rwv{nullptr};
     JPEGDEC       *jd{nullptr};
     int            index{0};
+    // Per-decode draw context, handed to the draw callback via JPEGDEC's
+    // user pointer. For scale2x (Encoding::JPEG_HALF) decodes, the decode
+    // runs at origin (0,0) and the callback maps each half-res chunk to
+    // dst + 2*local while pixel-doubling.
+    int16_t dst_x{0};
+    int16_t dst_y{0};
+    bool    scale2x{false};
   };
   static constexpr int kMaxDecodeWorkers = 2;
   DecodeWorker  workers_[kMaxDecodeWorkers]{};
@@ -176,6 +183,11 @@ class RemoteWebView : public Component {
   // and PSRAM framebuffer writes contend on one bus anyway — parallel decode
   // is where the win is, parallel draw would buy nothing.
   SemaphoreHandle_t draw_mtx_{nullptr};
+  // Shared pixel-doubling staging buffer for JPEG_HALF tiles, used only
+  // while holding draw_mtx_. Sized for the largest JPEGDRAW chunk (2048 px)
+  // doubled 2x2: 8192 px * 2 bytes.
+  static constexpr size_t kScaleBufPixels = 2048 * 4;
+  uint16_t *scale_buf_{nullptr};
   // Guards the per-frame/stat counters below against concurrent workers.
   SemaphoreHandle_t stats_mtx_{nullptr};
   // Frame barrier: tiles of one frame may decode in parallel, but a worker
@@ -205,17 +217,18 @@ class RemoteWebView : public Component {
   static void ws_event_handler_(void *handler_arg, esp_event_base_t base, int32_t event_id, void *event_data);
   static void reasm_release_(RemoteWebView *self, WsReasm &r);
 
-  void process_packet_(JPEGDEC *jd, const uint8_t *data, size_t len, int64_t t_enq_us);
-  void process_frame_packet_(JPEGDEC *jd, const uint8_t *data, size_t len, int64_t t_enq_us);
+  void process_packet_(DecodeWorker *wk, const uint8_t *data, size_t len, int64_t t_enq_us);
+  void process_frame_packet_(DecodeWorker *wk, const uint8_t *data, size_t len, int64_t t_enq_us);
   void process_frame_stats_packet_(const uint8_t *data, size_t len);
   bool frame_barrier_enter_(uint32_t frame_id, size_t msg_len, uint16_t tile_count, int64_t t_enq_us);
   void frame_barrier_exit_();
-  bool decode_jpeg_tile_to_lcd_(JPEGDEC *jd, int16_t dst_x, int16_t dst_y, const uint8_t *data, size_t len);
-  bool decode_jpeg_tile_software_(JPEGDEC *jd, int16_t dst_x, int16_t dst_y, const uint8_t *data, size_t len);
+  bool decode_jpeg_tile_to_lcd_(DecodeWorker *wk, int16_t dst_x, int16_t dst_y, const uint8_t *data, size_t len, bool scale2x);
+  bool decode_jpeg_tile_software_(DecodeWorker *wk, int16_t dst_x, int16_t dst_y, const uint8_t *data, size_t len, bool scale2x);
   JPEGDEC *alloc_jpegdec_();
 
   static int jpeg_draw_cb_s_(JPEGDRAW *p);
-  int jpeg_draw_cb_(JPEGDRAW *p);
+  int jpeg_draw_cb_(DecodeWorker *wk, JPEGDRAW *p);
+  int jpeg_draw_scaled_(DecodeWorker *wk, JPEGDRAW *p);
 
   bool ws_send_touch_event_(proto::TouchType type, int x, int y, uint8_t pid);
   bool ws_send_keepalive_();
